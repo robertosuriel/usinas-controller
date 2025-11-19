@@ -31,6 +31,6 @@ credentials.py
 .DS_Store
 Thumbs.db
 
-# Documentos temporários
-*.txt
-*.md
+# Documentos temporários específicos
+*.tmp.txt
+*.temp.txt
