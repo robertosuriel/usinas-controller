@@ -1,0 +1,36 @@
+# Arquivos Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Arquivos de dados sensíveis
+*.json
+*.csv
+*.sql
+
+# Arquivos de log
+*.log
+
+# Arquivos temporários
+*.tmp
+*.temp
+
+# Credenciais e configurações
+config.py
+credentials.py
+.env
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
+
+# Documentos temporários
+*.txt
+*.md
