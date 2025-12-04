@@ -1,0 +1,28 @@
+# INCLUIR TUDO POR PADRÃO - Apenas permitir arquivos específicos
+*
+
+# ARQUIVOS PERMITIDOS (negar o ignore)
+!dashboard_v2.py
+!requirements.txt
+!README.md
+!.gitignore
+
+# Manter estrutura de diretórios vazia
+!*/
+!**/.gitkeep
+
+# ARQUIVOS SENSÍVEIS - NUNCA COMMITAR
+.streamlit/secrets.toml
+.env
+*.pem
+*.key
+config_*.py
+
+# Arquivos do sistema sempre ignorados
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+logs/
