@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 import plotly.graph_objects as go
 import plotly.express as px
-import pytz
+import pytz 
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -16,7 +16,7 @@ st.set_page_config(
 @st.cache_resource
 def init_connection():
     try:
-        # O Streamlit busca automaticamente as credenciais em .streamlit/secrets.toml
+        # Conecta usando os segredos configurados no .streamlit/secrets.toml ou no Cloud
         conn = st.connection("postgresql", type="sql")
         return conn
     except Exception as e:
@@ -28,7 +28,6 @@ conn = init_connection()
 # --- FUNÇÕES DE BUSCA DE DADOS ---
 @st.cache_data(ttl=600) 
 def get_usinas():
-    # Adicionado potencia_pico_kwp para cálculo de meta
     if conn:
         df = conn.query("SELECT id_usina, nome_usina, fabricante_api, potencia_pico_kwp FROM tbl_usinas ORDER BY nome_usina", ttl=600)
         return df
@@ -44,7 +43,7 @@ def get_inversores_por_usinas(lista_ids_usinas: list):
 @st.cache_data(ttl=300) 
 def get_dados_historicos(lista_ids_inversores: list, data_inicio: date, data_fim: date):
     if not lista_ids_inversores or not conn: return pd.DataFrame()
-    # Busca dados detalhados
+    
     query = """
     SELECT 
         l.timestamp_utc, 
@@ -81,7 +80,7 @@ else:
     if usinas_df.empty:
         st.sidebar.error("Nenhuma usina encontrada.")
     else:
-        # Filtro 1: Usinas
+        # --- FILTRO 1: USINAS ---
         nomes_usinas_selecionadas = st.sidebar.multiselect(
             "Selecione as Usinas:",
             options=usinas_df['nome_usina'].unique(),
@@ -89,14 +88,13 @@ else:
         )
         
         if not nomes_usinas_selecionadas:
-            st.warning("Selecione ao menos uma usina.")
+            st.warning("Selecione ao menos uma usina para começar.")
             st.stop() 
             
-        # Dados das usinas selecionadas (incluindo capacidade para meta)
         usinas_sel_df = usinas_df[usinas_df['nome_usina'].isin(nomes_usinas_selecionadas)]
         ids_usinas_selecionadas = [int(x) for x in usinas_sel_df['id_usina'].tolist()]
         
-        # Filtro 2: Inversores
+        # --- FILTRO 2: INVERSORES ---
         inversores_df = get_inversores_por_usinas(ids_usinas_selecionadas)
         opcoes_inversores = ["-- TODOS OS INVERSORES --"] + inversores_df['nome_inversor'].unique().tolist()
         
@@ -109,13 +107,13 @@ else:
         if not selecao_inversores:
             st.warning("Selecione ao menos um inversor.")
             st.stop()
-            
+        
         if "-- TODOS OS INVERSORES --" in selecao_inversores or len(selecao_inversores) == 0:
             ids_inversores_finais = [int(x) for x in inversores_df['id_inversor'].tolist()]
         else:
             ids_inversores_finais = [int(x) for x in inversores_df[inversores_df['nome_inversor'].isin(selecao_inversores)]['id_inversor'].tolist()]
             
-        # Filtros de Data (Padrao: Ano atual para ficar bonito no resumo gerencial)
+        # --- FILTRO 3: DATAS ---
         st.sidebar.markdown("---")
         # Default: Início do ano até hoje
         data_padrao_inicio = date(datetime.now().year, 1, 1)
@@ -126,27 +124,23 @@ else:
         tab_resumo, tab_historico, tab_comparacao, tab_status_dia = st.tabs(["📊 Resumo Gerencial", "📈 Análise Histórica", "🔎 Comparação de Dias", "⚡ Status Real-Time"])
 
         # ==============================================================================
-        # ABA 0: RESUMO GERENCIAL (NOVA)
+        # ABA 0: RESUMO GERENCIAL
         # ==============================================================================
         with tab_resumo:
             st.title("Resumo Gerencial")
             
-            # Busca dados
             df = get_dados_historicos(ids_inversores_finais, data_inicio, data_fim)
 
             if df.empty:
                 st.info("Nenhum dado encontrado para esta seleção no período.")
             else:
-                # Preparação dos Dados
                 df['timestamp_utc'] = pd.to_datetime(df['timestamp_utc'])
                 df['timestamp_local'] = df['timestamp_utc'].dt.tz_convert('America/Sao_Paulo')
                 df = df.set_index('timestamp_local')
                 
-                # Cálculo da Meta Diária Base (Capacidade kWp * HSP 5.0)
                 capacidade_total_sel = usinas_sel_df['potencia_pico_kwp'].sum()
                 meta_diaria_base = float(capacidade_total_sel or 0) * 5.0
 
-                # --- KPI TOPO ---
                 total_gerado_periodo = df['energia_intervalo_wh'].sum() / 1000.0
                 dias_periodo = (data_fim - data_inicio).days + 1
                 meta_periodo = meta_diaria_base * dias_periodo
@@ -159,7 +153,6 @@ else:
                 
                 st.divider()
 
-                # --- GRÁFICOS MACRO (ANO / MÊS) ---
                 col_ano, col_mes = st.columns(2)
 
                 # 1. Dados Anuais
@@ -171,57 +164,43 @@ else:
                     x=df_ano.index, y=df_ano.values, name='Realizado', marker_color='#2E86C1',
                     text=df_ano.values, texttemplate='%{text:.0f}', textposition='auto'
                 ))
-                fig_ano.update_layout(title="Energia por Ano (kWh)", height=300)
+                # CORREÇÃO 1: Forçar eixo X a ser categoria (evita 2,024.8)
+                fig_ano.update_layout(title="Energia por Ano (kWh)", height=300, xaxis=dict(type='category'))
                 col_ano.plotly_chart(fig_ano, use_container_width=True)
 
                 # 2. Dados Mensais
                 df_mes = df.resample('ME')['energia_intervalo_wh'].sum() / 1000.0
-                # Meta Mensal (aprox)
                 metas_mensais = [meta_diaria_base * 30] * len(df_mes) 
                 
                 fig_mes = go.Figure()
                 fig_mes.add_trace(go.Bar(
-                    x=df_mes.index.strftime('%b/%y'), 
-                    y=df_mes.values, 
-                    name='Realizado', 
-                    marker_color='#1ABC9C'
+                    x=df_mes.index.strftime('%b/%y'), y=df_mes.values, name='Realizado', marker_color='#1ABC9C'
                 ))
                 fig_mes.add_trace(go.Scatter(
-                    x=df_mes.index.strftime('%b/%y'),
-                    y=metas_mensais,
-                    mode='lines+markers',
-                    name='Meta Mensal',
+                    x=df_mes.index.strftime('%b/%y'), y=metas_mensais, mode='lines+markers', name='Meta Mensal',
                     line=dict(color='red', width=2, dash='dash')
                 ))
+                # Mensal já é string formatada, então é categoria por padrão
                 fig_mes.update_layout(title="Energia por Mês (kWh)", height=300, hovermode="x unified")
                 col_mes.plotly_chart(fig_mes, use_container_width=True)
 
                 # --- GRÁFICO MICRO (DIÁRIO) ---
                 st.subheader("Energia Diária (Detalhada)")
-                
                 df_dia = df.resample('D')['energia_intervalo_wh'].sum() / 1000.0
                 metas_diarias = [meta_diaria_base] * len(df_dia)
 
                 fig_dia = go.Figure()
                 fig_dia.add_trace(go.Bar(
-                    x=df_dia.index.strftime('%d/%m'), 
-                    y=df_dia.values, 
-                    name='Realizado',
-                    marker_color='#9B59B6'
+                    x=df_dia.index.strftime('%d/%m'), y=df_dia.values, name='Realizado', marker_color='#9B59B6'
                 ))
                 fig_dia.add_trace(go.Scatter(
-                    x=df_dia.index.strftime('%d/%m'),
-                    y=metas_diarias,
-                    mode='lines',
-                    name='Meta Diária',
+                    x=df_dia.index.strftime('%d/%m'), y=metas_diarias, mode='lines', name='Meta Diária',
                     line=dict(color='#F1C40F', width=3)
                 ))
                 fig_dia.update_layout(
                     title=f"Evolução Diária ({data_inicio.strftime('%d/%m')} a {data_fim.strftime('%d/%m')})",
-                    xaxis_title="Dia",
-                    yaxis_title="kWh",
-                    hovermode="x unified",
-                    height=400
+                    xaxis_title="Dia", yaxis_title="kWh", hovermode="x unified", height=400,
+                    xaxis=dict(type='category') # Garante que dias não virem números estranhos
                 )
                 st.plotly_chart(fig_dia, use_container_width=True)
 
@@ -242,14 +221,12 @@ else:
                 exibir_meta = st.checkbox("Comparar com Meta (Target)", value=True, key="cb_meta")
 
             if not df.empty:
-                # Define coluna de agrupamento
                 if agrupar_por == "Usina":
                     group_col = 'nome_usina'
                 else:
                     df['nome_inversor_unico'] = df['nome_usina'] + ' - ' + df['nome_inversor']
                     group_col = 'nome_inversor_unico'
 
-                # Consolidação Temporal
                 if visao_temporal == "Diário":
                     rule = 'D'; format_data = '%d/%m/%Y'
                 elif visao_temporal == "Mensal":
@@ -261,13 +238,11 @@ else:
                 df_resampled = df_resampled / 1000.0 
                 df_resampled.index = df_resampled.index.strftime(format_data)
 
-                # Meta
                 fator_tempo = 1
                 if visao_temporal == "Mensal": fator_tempo = 30
                 if visao_temporal == "Anual": fator_tempo = 365
                 meta_energia = meta_diaria_base * fator_tempo
                 
-                # Gráfico Barras
                 st.subheader(f"Geração de Energia ({visao_temporal})")
                 fig_bar = go.Figure()
                 for col in df_resampled.columns:
@@ -276,10 +251,10 @@ else:
                 if exibir_meta:
                     fig_bar.add_trace(go.Scatter(x=df_resampled.index, y=[meta_energia]*len(df_resampled), mode='lines', name='Meta', line=dict(color='red', width=2, dash='dash')))
 
-                fig_bar.update_layout(barmode='group', hovermode="x unified", height=500)
+                # CORREÇÃO 2: Forçar type='category' aqui também para evitar problemas em visão Anual
+                fig_bar.update_layout(barmode='group', hovermode="x unified", height=500, xaxis=dict(type='category'))
                 st.plotly_chart(fig_bar, use_container_width=True)
 
-                # Curva Potência (Só diário)
                 if visao_temporal == "Diário":
                     st.subheader("Curva de Potência")
                     df_potencia = df.pivot_table(index='timestamp_local', columns=group_col, values='potencia_ativa_kw', aggfunc='sum')
