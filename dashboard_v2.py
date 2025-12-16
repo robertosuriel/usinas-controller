@@ -7,40 +7,43 @@ import pytz
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
-    page_title="Dashboard de Usinas",
+    page_title="Dashboard de Usinas | SOL Online",
     page_icon="☀️",
     layout="wide"
 )
 
-# --- LOGO SOL ONLINE ---
-try:
-    st.image("solonline-foto.png", width=250)
-except:
-    try:
-        st.image("./solonline-foto.png", width=250)
-    except:
-        # Fallback para logo em texto
-        st.markdown("### 🌞 SOL ONLINE - Dashboard de Usinas")
+# ==============================================================================
+# ESTILIZAÇÃO CSS (IDENTIDADE VISUAL SOL ONLINE)
+# ==============================================================================
+st.markdown("""
+<style>
+    /* Sidebar Rosa */
+    [data-testid="stSidebar"] {
+        background-color: #E91E63;
+    }
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, 
+    [data-testid="stSidebar"] label, [data-testid="stSidebar"] .stMarkdown p {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] span { color: #f0f0f0; }
+    [data-testid="stSidebar"] hr { border-color: rgba(255, 255, 255, 0.4) !important; }
 
-# --- CONEXÃO COM O BANCO ---
-@st.cache_resource
-def init_connection():
-    try:
-        # Conecta usando os segredos configurados no .streamlit/secrets.toml ou no Cloud
-        conn = st.connection("postgresql", type="sql")
-        return conn
-    except Exception as e:
-        st.error(f"ERRO DE CONEXÃO: {e}")
-        return None
+    /* Títulos e KPIs em Rosa */
+    h1, h2, h3, [data-testid="stMetricValue"] {
+        color: #E91E63 !important;
+    }
+    :root { --primary-color: #00E676; }
+</style>
+""", unsafe_allow_html=True)
 
-conn = init_connection()
+SOL_COLORS = ['#00E676', '#E91E63', '#FFC107', '#2196F3', '#9C27B0']
 
 # ------------------------------------------------------------------
-# FUNÇÕES DE TARGETS (METAS) - MELHORIAS DO V4
+# 1. FUNÇÕES DE TARGETS (METAS)
 # ------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_targets():
-    """Carrega os targets do arquivo Excel e mapeia para as usinas do BD"""
+    """Carrega o Excel e cria um mapa DIÁRIO: {(Mes, Dia): Valor}"""
     try:
         mapeamento_targets = {
             'Riachão': {'aba_max': 'Riachão_Max', 'aba_min': 'Riachão_Min', 'potencia_ref': 118},
@@ -55,384 +58,353 @@ def load_targets():
                 df_max = pd.read_excel('Targets das Usinas_add 132.xlsx', sheet_name=config['aba_max'], header=2)
                 df_min = pd.read_excel('Targets das Usinas_add 132.xlsx', sheet_name=config['aba_min'], header=2)
             except Exception:
-                # Fallback se não conseguir ler o Excel
-                targets_dict[usina_key] = {'max': [500] * 12, 'min': [450] * 12, 'potencia_ref': config['potencia_ref']}
                 continue
 
-            targets_mensais_max = []
-            targets_mensais_min = []
+            diario_max = {}
+            diario_min = {}
             
-            for mes in range(1, 13):
-                if mes <= len(df_max):
-                    valores_max, valores_min = [], []
-                    
+            for mes_idx in range(12): 
+                mes_num = mes_idx + 1 
+                if mes_idx < len(df_max):
                     for col in df_max.columns:
-                        if isinstance(col, (int, float)) or (isinstance(col, str) and col.replace('.', '').isdigit()):
-                            try:
-                                val_max = df_max.iloc[mes, df_max.columns.get_loc(col)]
-                                val_min = df_min.iloc[mes, df_min.columns.get_loc(col)]
-                                if pd.notna(val_max) and isinstance(val_max, (int, float)): valores_max.append(float(val_max))
-                                if pd.notna(val_min) and isinstance(val_min, (int, float)): valores_min.append(float(val_min))
-                            except: continue
-                    
-                    if valores_max and valores_min:
-                        targets_mensais_max.append(sum(valores_max) / len(valores_max))
-                        targets_mensais_min.append(sum(valores_min) / len(valores_min))
-                    else:
-                        targets_mensais_max.append(500)
-                        targets_mensais_min.append(450)
-                else:
-                    targets_mensais_max.append(500)
-                    targets_mensais_min.append(450)
+                        try:
+                            dia = int(float(str(col)))
+                            if 1 <= dia <= 31:
+                                val_max = df_max.iloc[mes_idx, df_max.columns.get_loc(col)]
+                                val_min = df_min.iloc[mes_idx, df_min.columns.get_loc(col)]
+                                if pd.notna(val_max): diario_max[(mes_num, dia)] = float(val_max)
+                                if pd.notna(val_min): diario_min[(mes_num, dia)] = float(val_min)
+                        except: continue
             
-            targets_dict[usina_key] = {'max': targets_mensais_max, 'min': targets_mensais_min, 'potencia_ref': config['potencia_ref']}
-        
+            targets_dict[usina_key] = {
+                'max': diario_max,
+                'min': diario_min,
+                'potencia_ref': config['potencia_ref']
+            }
         return targets_dict
-        
     except Exception as e:
-        st.warning(f"Erro ao carregar targets: {e}")
-        return {'Riachão': {'max': [500] * 12, 'min': [450] * 12, 'potencia_ref': 118}, 'Xique-xique': {'max': [520] * 12, 'min': [470] * 12, 'potencia_ref': 118}}
+        st.error(f"Erro ao ler targets: {e}")
+        return {}
 
 @st.cache_data
-def get_target_range_mensal(nome_usina, potencia_kwp, mes):
-    """Retorna o range (min, max) do target mensal para uma usina específica"""
+def get_target_range_diario(nome_usina, potencia_kwp, data_alvo):
+    """
+    Retorna o target exato para um DIA específico com as regras atualizadas.
+    """
     targets_data = load_targets()
+    
     nome_lower = nome_usina.lower()
+    usina_key = 'Xique-xique' # Default geral
     
-    if 'riachão' in nome_lower or 'riachao' in nome_lower or 'jacuipe' in nome_lower:
+    # --- REGRAS DE MAPEAMENTO ESPECÍFICAS ---
+    
+    # 1. Blue Solutions e Riachão -> RIACHÃO
+    if any(k in nome_lower for k in ['riachão', 'riachao', 'jacuipe', 'blue']):
         usina_key = 'Riachão'
-    elif 'xique' in nome_lower or 'poções' in nome_lower or 'pocoes' in nome_lower or 'domingos' in nome_lower:
-        usina_key = 'Xique-xique_132' if potencia_kwp and potencia_kwp >= 130 else 'Xique-xique'
-    elif any(local in nome_lower for local in ['itaguaçu', 'itaguacu', 'varzea', 'várzea']):
-        usina_key = 'Xique-xique'  # Sempre usar Xique-xique normal para Itaguaçu
+        
+    # 2. Usina 10 -> XIQUE-XIQUE 132 (Forçado)
+    elif 'usina 10' in nome_lower:
+        usina_key = 'Xique-xique_132'
+        
+    # 3. Usina 11 e Usina 12 -> XIQUE-XIQUE (Normal/118)
+    elif any(k in nome_lower for k in ['usina 11', 'usina 12']):
+        usina_key = 'Xique-xique'
+        
+    # 4. Demais Usinas -> Regra de Potência
     else:
-        usina_key = 'Riachão'
+        if potencia_kwp and potencia_kwp >= 130:
+            usina_key = 'Xique-xique_132'
+        else:
+            usina_key = 'Xique-xique'
     
-    if usina_key and usina_key in targets_data:
-        target_info = targets_data[usina_key]
-        target_max = target_info['max'][mes-1] if mes <= len(target_info['max']) else 500
-        target_min = target_info['min'][mes-1] if mes <= len(target_info['min']) else 450
+    # --- BUSCA DO VALOR ---
+    target_min, target_max = 0, 0
+    if usina_key in targets_data:
+        t_info = targets_data[usina_key]
+        chave_dia = (data_alvo.month, data_alvo.day)
         
-        if potencia_kwp and target_info['potencia_ref']:
-            fator_escala = potencia_kwp / target_info['potencia_ref']
-            target_max *= fator_escala
-            target_min *= fator_escala
+        t_max = t_info['max'].get(chave_dia, 500)
+        t_min = t_info['min'].get(chave_dia, 450)
+        
+        # Escala pela potência
+        if potencia_kwp and t_info['potencia_ref']:
+            fator = potencia_kwp / t_info['potencia_ref']
+            target_min *= fator
+            target_max *= fator
+    else:
+        # Fallback
+        p_def = potencia_kwp or 100
+        target_min, target_max = p_def * 4.5, p_def * 5.5
             
-        return target_min, target_max
-    
-    potencia_default = potencia_kwp or 100
-    return potencia_default * 4.5, potencia_default * 5.5
+    return target_min, target_max
 
-@st.cache_data
 def calcular_targets_periodo(usinas_df, timestamps, fator_tempo=1):
-    """Calcula targets min e max para um período de tempo de forma otimizada"""
-    targets_min, targets_max = [], []
+    """Calcula listas de targets somados para plotagem"""
+    targets_min = []
+    targets_max = []
     
-    for timestamp in timestamps:
-        mes_num = timestamp.month
-        target_total_min = target_total_max = 0
+    for ts in timestamps:
+        data_ref = ts.date() if isinstance(ts, pd.Timestamp) or isinstance(ts, datetime) else ts
+        t_total_min = 0
+        t_total_max = 0
         
-        for _, usina_row in usinas_df.iterrows():
-            nome_usina = usina_row['nome_usina']
-            potencia_usina = usina_row['potencia_pico_kwp']
-            target_min, target_max = get_target_range_mensal(nome_usina, potencia_usina, mes_num)
-            target_total_min += target_min * fator_tempo
-            target_total_max += target_max * fator_tempo
+        for _, row in usinas_df.iterrows():
+            t_min, t_max = get_target_range_diario(row['nome_usina'], row['potencia_pico_kwp'], data_ref)
+            
+            if fator_tempo == 'mes_real':
+                import calendar
+                _, dias_no_mes = calendar.monthrange(data_ref.year, data_ref.month)
+                fator = dias_no_mes
+            else:
+                fator = fator_tempo
+                
+            t_total_min += t_min * fator
+            t_total_max += t_max * fator
+            
+        targets_min.append(t_total_min)
+        targets_max.append(t_total_max)
         
-        targets_min.append(target_total_min)
-        targets_max.append(target_total_max)
-    
     return targets_min, targets_max
 
-# --- FUNÇÕES DE BUSCA DE DADOS ---
-@st.cache_data(ttl=600) 
+# ------------------------------------------------------------------
+# 2. CONEXÃO E DADOS
+# ------------------------------------------------------------------
+@st.cache_resource
+def init_connection():
+    try:
+        return st.connection("postgresql", type="sql")
+    except Exception as e:
+        st.error(f"Erro BD: {e}")
+        return None
+
+conn = init_connection()
+
+@st.cache_data(ttl=600)
 def get_usinas():
-    if conn:
-        df = conn.query("SELECT id_usina, nome_usina, fabricante_api, potencia_pico_kwp FROM tbl_usinas ORDER BY nome_usina", ttl=600)
-        return df
+    if conn: return conn.query("SELECT id_usina, nome_usina, fabricante_api, potencia_pico_kwp FROM tbl_usinas ORDER BY nome_usina", ttl=600)
     return pd.DataFrame()
 
 @st.cache_data(ttl=600)
-def get_inversores_por_usinas(lista_ids_usinas: list):
-    if not lista_ids_usinas or not conn: return pd.DataFrame()
-    query = "SELECT id_inversor, nome_inversor, id_usina FROM tbl_inversores WHERE id_usina = ANY(:lista_ids) ORDER BY nome_inversor"
-    df = conn.query(query, params={"lista_ids": lista_ids_usinas}, ttl=600)
-    return df
+def get_inversores_por_usinas(lista_ids):
+    if not lista_ids or not conn: return pd.DataFrame()
+    return conn.query("SELECT id_inversor, nome_inversor, id_usina FROM tbl_inversores WHERE id_usina = ANY(:ids) ORDER BY nome_inversor", params={"ids": lista_ids}, ttl=600)
 
-@st.cache_data(ttl=300) 
-def get_dados_historicos(lista_ids_inversores: list, data_inicio: date, data_fim: date):
-    if not lista_ids_inversores or not conn: return pd.DataFrame()
-    
+@st.cache_data(ttl=300)
+def get_dados_historicos(lista_ids, data_ini, data_fim):
+    if not lista_ids or not conn: return pd.DataFrame()
     query = """
-    SELECT 
-        l.timestamp_utc, 
-        l.potencia_ativa_kw,
-        l.energia_intervalo_wh,
-        i.nome_inversor,
-        u.nome_usina,
-        u.id_usina
+    SELECT l.timestamp_utc, l.potencia_ativa_kw, l.energia_intervalo_wh, i.nome_inversor, u.nome_usina, u.id_usina
     FROM tbl_leituras l
     JOIN tbl_inversores i ON l.id_inversor = i.id_inversor
     JOIN tbl_usinas u ON i.id_usina = u.id_usina
-    WHERE l.id_inversor = ANY(:lista_ids)
-      AND l.timestamp_utc BETWEEN :data_inicio AND :data_fim_ajustada
-    ORDER BY l.timestamp_utc;
+    WHERE l.id_inversor = ANY(:ids) AND l.timestamp_utc >= :d_ini AND l.timestamp_utc < :d_fim
+    ORDER BY l.timestamp_utc
+    LIMIT 100000;
     """
-    data_fim_ajustada = data_fim + timedelta(days=1)
-    
-    df = conn.query(query, params={
-        "lista_ids": lista_ids_inversores, 
-        "data_inicio": data_inicio, 
-        "data_fim_ajustada": data_fim_ajustada
-    }, ttl=300)
-    return df
+    try:
+        df = conn.query(query, params={"ids": lista_ids, "d_ini": data_ini, "d_fim": data_fim + timedelta(days=1)}, ttl=300)
+        if len(df) >= 100000: st.toast("⚠️ Dados truncados. Reduza o período.", icon="📉")
+        return df
+    except Exception as e:
+        st.error(f"Erro dados: {e}")
+        return pd.DataFrame()
 
-# --- INTERFACE DO USUÁRIO ---
+# ------------------------------------------------------------------
+# 3. INTERFACE DO USUÁRIO
+# ------------------------------------------------------------------
+
+try:
+    st.sidebar.image("solonline-foto.png", use_container_width=True)
+except:
+    st.sidebar.markdown("<h2 style='color: white; text-align: center;'>🌞 SOL ONLINE</h2>", unsafe_allow_html=True)
 
 st.sidebar.title("Filtros")
 
-if conn is None:
-    st.warning("Aguardando conexão com o banco...")
-else:
+if conn:
     usinas_df = get_usinas()
+    if not usinas_df.empty:
+        sel_usinas = st.sidebar.multiselect("Usinas:", usinas_df['nome_usina'].unique(), default=usinas_df['nome_usina'].iloc[0])
+        if not sel_usinas: st.stop()
+        
+        usinas_sel_df = usinas_df[usinas_df['nome_usina'].isin(sel_usinas)]
+        ids_usinas = [int(x) for x in usinas_sel_df['id_usina']]
+        
+        inv_df = get_inversores_por_usinas(ids_usinas)
+        sel_inv = st.sidebar.multiselect("Inversores:", ["-- TODOS --"] + inv_df['nome_inversor'].unique().tolist(), default="-- TODOS --")
+        ids_inv_finais = [int(x) for x in inv_df['id_inversor']] if "-- TODOS --" in sel_inv or not sel_inv else [int(x) for x in inv_df[inv_df['nome_inversor'].isin(sel_inv)]['id_inversor']]
 
-    if usinas_df.empty:
-        st.sidebar.error("Nenhuma usina encontrada.")
-    else:
-        # --- FILTRO 1: USINAS ---
-        nomes_usinas_selecionadas = st.sidebar.multiselect(
-            "Selecione as Usinas:",
-            options=usinas_df['nome_usina'].unique(),
-            default=usinas_df['nome_usina'].iloc[0] 
-        )
-        
-        if not nomes_usinas_selecionadas:
-            st.warning("Selecione ao menos uma usina para começar.")
-            st.stop() 
-            
-        usinas_sel_df = usinas_df[usinas_df['nome_usina'].isin(nomes_usinas_selecionadas)]
-        ids_usinas_selecionadas = [int(x) for x in usinas_sel_df['id_usina'].tolist()]
-        
-        # --- FILTRO 2: INVERSORES ---
-        inversores_df = get_inversores_por_usinas(ids_usinas_selecionadas)
-        opcoes_inversores = ["-- TODOS OS INVERSORES --"] + inversores_df['nome_inversor'].unique().tolist()
-        
-        selecao_inversores = st.sidebar.multiselect(
-            "Selecione os Inversores:",
-            options=opcoes_inversores,
-            default="-- TODOS OS INVERSORES --"
-        )
-
-        if not selecao_inversores:
-            st.warning("Selecione ao menos um inversor.")
-            st.stop()
-        
-        if "-- TODOS OS INVERSORES --" in selecao_inversores or len(selecao_inversores) == 0:
-            ids_inversores_finais = [int(x) for x in inversores_df['id_inversor'].tolist()]
-        else:
-            ids_inversores_finais = [int(x) for x in inversores_df[inversores_df['nome_inversor'].isin(selecao_inversores)]['id_inversor'].tolist()]
-            
-        # --- FILTRO 3: DATAS ---
         st.sidebar.markdown("---")
-        # Default: Início do ano até hoje
-        data_padrao_inicio = date(datetime.now().year, 1, 1)
-        data_inicio = st.sidebar.date_input("Data de Início", data_padrao_inicio)
-        data_fim = st.sidebar.date_input("Data de Fim", datetime.now().date())
+        hoje = datetime.now().date()
+        d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
+        d_fim = st.sidebar.date_input("Fim", hoje)
+        if (d_fim - d_ini).days > 31: st.sidebar.info("💡 Períodos longos podem ser lentos.")
 
-        # --- ABAS ---
-        tab_resumo, tab_historico, tab_comparacao, tab_status_dia = st.tabs(["📊 Resumo Gerencial", "📈 Análise Histórica", "🔎 Comparação de Dias", "⚡ Status Real-Time"])
+        with st.spinner("Atualizando dados..."):
+            main_df = get_dados_historicos(ids_inv_finais, d_ini, d_fim)
+            if not main_df.empty:
+                main_df['ts'] = pd.to_datetime(main_df['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
+                main_df_indexed = main_df.set_index('ts')
+            else:
+                main_df_indexed = pd.DataFrame()
 
-        # ==============================================================================
-        # ABA 0: RESUMO GERENCIAL
-        # ==============================================================================
+        tab_resumo, tab_hist, tab_comp, tab_status = st.tabs(["📊 Resumo Gerencial", "📈 Análise Técnica", "🔎 Comparação", "⚡ Status"])
+
+        # === ABA 1: RESUMO ===
         with tab_resumo:
             st.title("Resumo Gerencial")
-            
-            df = get_dados_historicos(ids_inversores_finais, data_inicio, data_fim)
+            if not main_df_indexed.empty:
+                total_gerado = main_df_indexed['energia_intervalo_wh'].sum() / 1000.0
+                meta_kpi_min, meta_kpi_max = calcular_targets_periodo(usinas_sel_df, pd.date_range(d_ini, d_fim), fator_tempo=1)
+                meta_periodo_avg = (sum(meta_kpi_min) + sum(meta_kpi_max)) / 2
+                perf = (total_gerado / meta_periodo_avg * 100) if meta_periodo_avg > 0 else 0
 
-            if df.empty:
-                st.info("Nenhum dado encontrado para esta seleção no período.")
-            else:
-                df['timestamp_utc'] = pd.to_datetime(df['timestamp_utc'])
-                df['timestamp_local'] = df['timestamp_utc'].dt.tz_convert('America/Sao_Paulo')
-                df = df.set_index('timestamp_local')
-                
-                capacidade_total_sel = usinas_sel_df['potencia_pico_kwp'].sum()
-                meta_diaria_base = float(capacidade_total_sel or 0) * 5.0
-
-                total_gerado_periodo = df['energia_intervalo_wh'].sum() / 1000.0
-                dias_periodo = (data_fim - data_inicio).days + 1
-                meta_periodo = meta_diaria_base * dias_periodo
-                perf_ratio = (total_gerado_periodo / meta_periodo * 100) if meta_periodo > 0 else 0
-
-                kpi1, kpi2, kpi3 = st.columns(3)
-                kpi1.metric("Energia Gerada Total", f"{total_gerado_periodo:,.0f} kWh")
-                kpi2.metric("Meta Estimada (Período)", f"{meta_periodo:,.0f} kWh")
-                kpi3.metric("Performance vs Meta", f"{perf_ratio:.1f}%", delta_color="normal")
-                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Gerado Total", f"{total_gerado:,.0f} kWh".replace(',', '.'))
+                c2.metric("Meta Estimada", f"{meta_periodo_avg:,.0f} kWh".replace(',', '.'))
+                c3.metric("Performance", f"{perf:.1f}%")
                 st.divider()
 
-                col_ano, col_mes = st.columns(2)
-
-                # 1. Dados Anuais
-                df_ano = df.resample('YE')['energia_intervalo_wh'].sum() / 1000.0
-                df_ano.index = df_ano.index.strftime('%Y')
+                c_ano, c_mes = st.columns(2)
                 
-                fig_ano = go.Figure()
-                fig_ano.add_trace(go.Bar(
-                    x=df_ano.index, y=df_ano.values, name='Realizado', marker_color='#2E86C1',
-                    text=df_ano.values, texttemplate='%{text:.0f}', textposition='auto'
-                ))
-                # CORREÇÃO 1: Forçar eixo X a ser categoria (evita 2,024.8)
-                fig_ano.update_layout(title="Energia por Ano (kWh)", height=300, xaxis=dict(type='category'))
-                col_ano.plotly_chart(fig_ano, use_container_width=True)
+                # Anual
+                df_ano = main_df_indexed.resample('YE')['energia_intervalo_wh'].sum() / 1000.0
+                df_ano.index = df_ano.index.strftime('%Y')
+                fig_ano = go.Figure(go.Bar(x=df_ano.index, y=df_ano.values, text=[f"{v:,.0f}".replace(',','.') for v in df_ano.values], textposition='auto', marker_color='#00E676', name='Realizado'))
+                fig_ano.update_layout(title="Energia/Ano (kWh)", height=300, xaxis=dict(type='category'), yaxis=dict(tickformat=',.0f'))
+                c_ano.plotly_chart(fig_ano, use_container_width=True)
 
-                # 2. Dados Mensais
-                df_mes = df.resample('ME')['energia_intervalo_wh'].sum() / 1000.0
-                metas_mensais = [meta_diaria_base * 30] * len(df_mes) 
+                # Mensal
+                df_mes = main_df_indexed.resample('ME')['energia_intervalo_wh'].sum() / 1000.0
+                t_mes_min, t_mes_max = calcular_targets_periodo(usinas_sel_df, df_mes.index, fator_tempo='mes_real')
                 
                 fig_mes = go.Figure()
-                fig_mes.add_trace(go.Bar(
-                    x=df_mes.index.strftime('%b/%y'), y=df_mes.values, name='Realizado', marker_color='#1ABC9C'
-                ))
+                fig_mes.add_trace(go.Bar(x=df_mes.index.strftime('%b/%y'), y=df_mes.values, marker_color='#00E676', name='Realizado'))
+                fig_mes.add_trace(go.Scatter(x=df_mes.index.strftime('%b/%y'), y=t_mes_max, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
                 fig_mes.add_trace(go.Scatter(
-                    x=df_mes.index.strftime('%b/%y'), y=metas_mensais, mode='lines+markers', name='Meta Mensal',
-                    line=dict(color='red', width=2, dash='dash')
+                    x=df_mes.index.strftime('%b/%y'), y=t_mes_min, mode='lines', fill='tonexty', 
+                    fillcolor='rgba(233, 30, 99, 0.2)', line=dict(color='rgba(233, 30, 99, 0.8)', width=1, dash='dot'),
+                    name='Meta (Faixa)', hovertemplate='Meta: %{y:,.0f} - %{customdata:,.0f} kWh', customdata=t_mes_max
                 ))
-                # Mensal já é string formatada, então é categoria por padrão
-                fig_mes.update_layout(title="Energia por Mês (kWh)", height=300, hovermode="x unified")
-                col_mes.plotly_chart(fig_mes, use_container_width=True)
+                fig_mes.update_layout(title="Energia/Mês (kWh)", height=300, hovermode="x unified", yaxis=dict(tickformat=',.0f'))
+                c_mes.plotly_chart(fig_mes, use_container_width=True)
 
-                # --- GRÁFICO MICRO (DIÁRIO) ---
-                st.subheader("Energia Diária (Detalhada)")
-                df_dia = df.resample('D')['energia_intervalo_wh'].sum() / 1000.0
-                metas_diarias = [meta_diaria_base] * len(df_dia)
+                # Diário
+                st.subheader("Evolução Diária")
+                df_dia = main_df_indexed.resample('D')['energia_intervalo_wh'].sum() / 1000.0
+                t_dia_min, t_dia_max = calcular_targets_periodo(usinas_sel_df, df_dia.index, fator_tempo=1)
 
                 fig_dia = go.Figure()
                 fig_dia.add_trace(go.Bar(
-                    x=df_dia.index.strftime('%d/%m'), y=df_dia.values, name='Realizado', marker_color='#9B59B6'
+                    x=df_dia.index.strftime('%d/%m'), y=df_dia.values, marker_color='#00E676', name='Realizado',
+                    text=[f"{v:,.0f}".replace(',','.') for v in df_dia.values], textposition='auto'
                 ))
+                fig_dia.add_trace(go.Scatter(x=df_dia.index.strftime('%d/%m'), y=t_dia_max, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
                 fig_dia.add_trace(go.Scatter(
-                    x=df_dia.index.strftime('%d/%m'), y=metas_diarias, mode='lines', name='Meta Diária',
-                    line=dict(color='#F1C40F', width=3)
+                    x=df_dia.index.strftime('%d/%m'), y=t_dia_min, mode='lines', fill='tonexty',
+                    fillcolor='rgba(233, 30, 99, 0.2)', line=dict(color='rgba(233, 30, 99, 0.8)', width=2),
+                    name='Meta (Faixa)', hovertemplate='Meta: %{y:,.0f} - %{customdata:,.0f} kWh', customdata=t_dia_max
                 ))
-                fig_dia.update_layout(
-                    title=f"Evolução Diária ({data_inicio.strftime('%d/%m')} a {data_fim.strftime('%d/%m')})",
-                    xaxis_title="Dia", yaxis_title="kWh", hovermode="x unified", height=400,
-                    xaxis=dict(type='category') # Garante que dias não virem números estranhos
-                )
+                fig_dia.update_layout(height=400, hovermode="x unified", xaxis=dict(type='category'), yaxis=dict(tickformat=',.0f'))
                 st.plotly_chart(fig_dia, use_container_width=True)
+            else: st.info("Sem dados no período.")
 
-        # ==============================================================================
-        # ABA 1: ANÁLISE HISTÓRICA
-        # ==============================================================================
-        with tab_historico:
-            st.title(f"Análise Técnica")
-            
-            c1, c2, c3 = st.columns([1, 1, 2])
-            with c1:
-                visao_temporal = st.selectbox("Visão Temporal:", ["Diário", "Mensal", "Anual"], key="vt_tec")
-            with c2:
-                agrupar_por = st.selectbox("Agrupar por:", ["Usina", "Inversor"], key="ag_tec")
-            with c3:
-                st.write("")
-                st.write("")
-                exibir_meta = st.checkbox("Comparar com Meta (Target)", value=True, key="cb_meta")
+        # === ABA 2: TÉCNICA ===
+        with tab_hist:
+            st.title("Análise Técnica")
+            c1, c2, c3 = st.columns([1,1,2])
+            visao = c1.selectbox("Visão:", ["Diário", "Mensal", "Anual"])
+            agrup = c2.selectbox("Agrupar:", ["Usina", "Inversor"])
+            meta_on = c3.checkbox("Exibir Meta (Individual)", True)
 
-            if not df.empty:
-                if agrupar_por == "Usina":
-                    group_col = 'nome_usina'
-                else:
-                    df['nome_inversor_unico'] = df['nome_usina'] + ' - ' + df['nome_inversor']
-                    group_col = 'nome_inversor_unico'
+            if not main_df_indexed.empty:
+                grp = 'nome_usina' if agrup == "Usina" else 'nome_inversor' 
+                df_tec = main_df_indexed.copy()
+                if agrup == "Inversor": df_tec['nome_inversor'] = df_tec['nome_usina'] + ' - ' + df_tec['nome_inversor']
 
-                if visao_temporal == "Diário":
-                    rule = 'D'; format_data = '%d/%m/%Y'
-                elif visao_temporal == "Mensal":
-                    rule = 'ME'; format_data = '%m/%Y'
-                else: 
-                    rule = 'YE'; format_data = '%Y'
-                
-                df_resampled = df.groupby([pd.Grouper(freq=rule), group_col])['energia_intervalo_wh'].sum().unstack(level=group_col).fillna(0)
-                df_resampled = df_resampled / 1000.0 
-                df_resampled.index = df_resampled.index.strftime(format_data)
+                rule = 'D' if visao == "Diário" else ('ME' if visao == "Mensal" else 'YE')
+                fmt = '%d/%m/%Y' if visao == "Diário" else ('%m/%Y' if visao == "Mensal" else '%Y')
 
-                fator_tempo = 1
-                if visao_temporal == "Mensal": fator_tempo = 30
-                if visao_temporal == "Anual": fator_tempo = 365
-                meta_energia = meta_diaria_base * fator_tempo
-                
-                st.subheader(f"Geração de Energia ({visao_temporal})")
-                fig_bar = go.Figure()
-                for col in df_resampled.columns:
-                    fig_bar.add_trace(go.Bar(x=df_resampled.index, y=df_resampled[col], name=col))
-                
-                if exibir_meta:
-                    fig_bar.add_trace(go.Scatter(x=df_resampled.index, y=[meta_energia]*len(df_resampled), mode='lines', name='Meta', line=dict(color='red', width=2, dash='dash')))
+                df_res = df_tec.groupby([pd.Grouper(freq=rule), grp])['energia_intervalo_wh'].sum().unstack(level=grp).fillna(0) / 1000.0
+                df_res.index = df_res.index.strftime(fmt)
 
-                # CORREÇÃO 2: Forçar type='category' aqui também para evitar problemas em visão Anual
-                fig_bar.update_layout(barmode='group', hovermode="x unified", height=500, xaxis=dict(type='category'))
-                st.plotly_chart(fig_bar, use_container_width=True)
+                fig = go.Figure()
+                for i, col_name in enumerate(df_res.columns):
+                    color = SOL_COLORS[i % len(SOL_COLORS)]
+                    fig.add_trace(go.Bar(x=df_res.index, y=df_res[col_name], name=col_name, marker_color=color))
 
-                if visao_temporal == "Diário":
+                    if meta_on and agrup == "Usina":
+                        usina_info = usinas_sel_df[usinas_sel_df['nome_usina'] == col_name]
+                        if not usina_info.empty:
+                            ts_idx = [datetime.strptime(d, fmt) for d in df_res.index]
+                            ft = 1
+                            if visao == "Mensal": ft = 'mes_real'
+                            if visao == "Anual": ft = 365
+                            
+                            t_min, t_max = calcular_targets_periodo(usina_info, pd.DatetimeIndex(ts_idx), fator_tempo=ft)
+                            
+                            fig.add_trace(go.Scatter(x=df_res.index, y=t_max, mode='lines', line=dict(color=color, width=2, dash='dot'), showlegend=False, hoverinfo='skip'))
+                            fig.add_trace(go.Scatter(
+                                x=df_res.index, y=t_min, mode='lines',
+                                line=dict(color=color, width=2, dash='dot'),
+                                name=f'Meta Min {col_name}',
+                                hovertemplate=f'{col_name} Meta: %{{y:,.0f}} - {t_max[0]:,.0f} kWh<extra></extra>'
+                            ))
+
+                fig.update_layout(barmode='group', hovermode="x unified", height=500, xaxis=dict(type='category'))
+                st.plotly_chart(fig, use_container_width=True)
+
+                if visao == "Diário":
                     st.subheader("Curva de Potência")
-                    df_potencia = df.pivot_table(index='timestamp_local', columns=group_col, values='potencia_ativa_kw', aggfunc='sum')
-                    fig_line = go.Figure()
-                    for col in df_potencia.columns:
-                        fig_line.add_trace(go.Scatter(x=df_potencia.index, y=df_potencia[col], mode='lines', name=col))
-                    fig_line.update_layout(hovermode="x unified", height=450)
-                    st.plotly_chart(fig_line, use_container_width=True)
+                    df_pot = df_tec.pivot_table(index='ts', columns=grp, values='potencia_ativa_kw', aggfunc='sum')
+                    fig_l = go.Figure()
+                    for i, col in enumerate(df_pot.columns): 
+                        fig_l.add_trace(go.Scatter(x=df_pot.index, y=df_pot[col], mode='lines', name=col, line=dict(color=SOL_COLORS[i % len(SOL_COLORS)])))
+                    fig_l.update_layout(hovermode="x unified", height=450)
+                    st.plotly_chart(fig_l, use_container_width=True)
 
-        # ==============================================================================
-        # ABA 2: COMPARAÇÃO DE DIAS
-        # ==============================================================================
-        with tab_comparacao:
-            st.title("Comparação Detalhada")
-            c1, c2 = st.columns([1, 3])
+        # === ABA 3: COMPARAÇÃO ===
+        with tab_comp:
+            st.title("Comparação")
+            c1, c2 = st.columns([1,3])
             with c1:
-                st.subheader("Configuração")
-                num_datas = st.number_input("Qtd Dias:", 2, 5, 2)
-                datas_comp = []
-                for i in range(num_datas):
-                    d = st.date_input(f"Dia {i+1}", value=datetime.now().date() - timedelta(days=(i*7)+1), key=f"dc_{i}")
-                    datas_comp.append(d)
-                metrica = st.selectbox("Métrica:", ["Potência Ativa (kW)", "Energia Acumulada (kWh)"])
-                if st.button("Comparar"): st.session_state['run_comp'] = True
-
+                qtd = st.number_input("Dias:", 2, 5, 2)
+                datas = [st.date_input(f"Dia {i+1}", hoje - timedelta(days=(i*7)+1)) for i in range(qtd)]
+                metr = st.selectbox("Métrica:", ["Potência (kW)", "Energia (kWh)"])
+            
             with c2:
-                if st.session_state.get('run_comp'):
-                    fig_comp = go.Figure()
-                    stats = []
-                    colors = px.colors.qualitative.Plotly
+                fig_c = go.Figure()
+                has_data = False
+                for i, d in enumerate(datas):
+                    dd = get_dados_historicos(ids_inv_finais, d, d)
+                    if dd.empty: continue
+                    has_data = True
+                    dd['ts'] = pd.to_datetime(dd['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
+                    agg = dd.groupby('ts').agg({'potencia_ativa_kw':'sum', 'energia_intervalo_wh':'sum'}).reset_index()
+                    agg['h'] = agg['ts'].dt.hour + agg['ts'].dt.minute/60
+                    agg['h_str'] = agg['ts'].dt.strftime('%H:%M')
+                    agg['e'] = agg['energia_intervalo_wh'].cumsum()/1000
+                    y = agg['potencia_ativa_kw'] if metr == "Potência (kW)" else agg['e']
+                    
+                    color = SOL_COLORS[i % len(SOL_COLORS)]
+                    fig_c.add_trace(go.Scatter(
+                        x=agg['h'], y=y, name=d.strftime('%d/%m'), 
+                        customdata=agg['h_str'], hovertemplate='<b>%{customdata}</b>: %{y:.2f}',
+                        line=dict(color=color, width=3)
+                    ))
+                
+                if has_data:
+                    fig_c.update_layout(title=f"Comparativo: {metr}", xaxis_title="Hora", hovermode="x unified", height=500, xaxis=dict(tickmode='array', tickvals=[0,6,12,18,24], ticktext=['00h','06h','12h','18h','24h']))
+                    st.plotly_chart(fig_c, use_container_width=True)
+                else: st.info("Selecione datas com dados.")
 
-                    for idx, dt in enumerate(datas_comp):
-                        df_d = get_dados_historicos(ids_inversores_finais, dt, dt)
-                        if df_d.empty: continue
-                        df_d['timestamp_local'] = pd.to_datetime(df_d['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
-                        df_agg = df_d.groupby('timestamp_local').agg({'potencia_ativa_kw':'sum', 'energia_intervalo_wh':'sum'}).reset_index()
-                        df_agg['hora'] = df_agg['timestamp_local'].dt.hour + df_agg['timestamp_local'].dt.minute/60
-                        df_agg['energia_acc'] = df_agg['energia_intervalo_wh'].cumsum() / 1000.0
-                        y_val = df_agg['potencia_ativa_kw'] if metrica == "Potência Ativa (kW)" else df_agg['energia_acc']
-                        
-                        fig_comp.add_trace(go.Scatter(x=df_agg['hora'], y=y_val, mode='lines', name=dt.strftime('%d/%m/%Y'), line=dict(width=2, color=colors[idx % len(colors)])))
-                        stats.append({"Data": dt.strftime('%d/%m/%Y'), "Energia (kWh)": df_agg['energia_acc'].max(), "Pico (kW)": df_agg['potencia_ativa_kw'].max()})
-
-                    fig_comp.update_layout(title=f"Comparativo: {metrica}", xaxis_title="Hora do Dia", hovermode="x unified", height=500)
-                    st.plotly_chart(fig_comp, use_container_width=True)
-                    if stats: st.dataframe(pd.DataFrame(stats).set_index("Data").style.format("{:.2f}"), use_container_width=True)
-
-        # ==============================================================================
-        # ABA 3: STATUS
-        # ==============================================================================
-        with tab_status_dia:
-            st.header("Monitoramento em Tempo Real")
-            if ids_inversores_finais:
-                q = """SELECT i.nome_inversor, u.nome_usina, MAX(l.timestamp_utc) as ultimo_sinal FROM tbl_leituras l JOIN tbl_inversores i ON l.id_inversor = i.id_inversor JOIN tbl_usinas u ON i.id_usina = u.id_usina WHERE l.id_inversor = ANY(:ids) GROUP BY i.nome_inversor, u.nome_usina ORDER BY ultimo_sinal DESC"""
-                df_s = conn.query(q, params={"ids": ids_inversores_finais}, ttl=60)
-                if not df_s.empty:
-                    df_s['ultimo_sinal'] = pd.to_datetime(df_s['ultimo_sinal']).dt.tz_convert('America/Sao_Paulo')
-                    now = datetime.now(pytz.timezone('America/Sao_Paulo'))
-                    df_s['status'] = df_s['ultimo_sinal'].apply(lambda x: "🔴 OFFLINE" if (now - x).total_seconds() > 1800 else "🟢 ONLINE")
-                    st.dataframe(df_s.style.format({"ultimo_sinal": lambda t: t.strftime("%d/%m %H:%M")}))
-                else: st.info("Sem dados recentes.")
-            else: st.warning("Nenhum inversor selecionado.")
+        # === ABA 4: STATUS ===
+        with tab_status:
+            st.header("Status Real-Time")
+            if ids_inv_finais:
+                q = "SELECT i.nome_inversor, u.nome_usina, MAX(l.timestamp_utc) as u_sinal FROM tbl_leituras l JOIN tbl_inversores i ON l.id_inversor = i.id_inversor JOIN tbl_usinas u ON i.id_usina = u.id_usina WHERE l.id_inversor = ANY(:ids) GROUP BY 1, 2 ORDER BY 3 DESC"
+                ds = conn.query(q, params={"ids": ids_inv_finais}, ttl=60)
+                if not ds.empty:
+                    ds['u_sinal'] = pd.to_datetime(ds['u_sinal']).dt.tz_convert('America/Sao_Paulo')
+                    ds['status'] = ds['u_sinal'].apply(lambda x: "🔴 OFF" if (datetime.now(pytz.timezone('America/Sao_Paulo')) - x).total_seconds() > 1800 else "🟢 ON")
+                    st.dataframe(ds.style.format({"u_sinal": lambda t: t.strftime("%d/%m %H:%M")}))
+                    
