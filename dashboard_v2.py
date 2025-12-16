@@ -12,6 +12,16 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- LOGO SOL ONLINE ---
+try:
+    st.image("solonline-foto.png", width=250)
+except:
+    try:
+        st.image("./solonline-foto.png", width=250)
+    except:
+        # Fallback para logo em texto
+        st.markdown("### 🌞 SOL ONLINE - Dashboard de Usinas")
+
 # --- CONEXÃO COM O BANCO ---
 @st.cache_resource
 def init_connection():
@@ -24,6 +34,115 @@ def init_connection():
         return None
 
 conn = init_connection()
+
+# ------------------------------------------------------------------
+# FUNÇÕES DE TARGETS (METAS) - MELHORIAS DO V4
+# ------------------------------------------------------------------
+@st.cache_data(ttl=3600)
+def load_targets():
+    """Carrega os targets do arquivo Excel e mapeia para as usinas do BD"""
+    try:
+        mapeamento_targets = {
+            'Riachão': {'aba_max': 'Riachão_Max', 'aba_min': 'Riachão_Min', 'potencia_ref': 118},
+            'Xique-xique': {'aba_max': 'Xique-xique_Max', 'aba_min': 'Xique-xique_Min', 'potencia_ref': 118},
+            'Xique-xique_132': {'aba_max': 'Xique-xique_Max 132kWp', 'aba_min': 'Xique-xique_Min 132kWp', 'potencia_ref': 132}
+        }
+        
+        targets_dict = {}
+        
+        for usina_key, config in mapeamento_targets.items():
+            try:
+                df_max = pd.read_excel('Targets das Usinas_add 132.xlsx', sheet_name=config['aba_max'], header=2)
+                df_min = pd.read_excel('Targets das Usinas_add 132.xlsx', sheet_name=config['aba_min'], header=2)
+            except Exception:
+                # Fallback se não conseguir ler o Excel
+                targets_dict[usina_key] = {'max': [500] * 12, 'min': [450] * 12, 'potencia_ref': config['potencia_ref']}
+                continue
+
+            targets_mensais_max = []
+            targets_mensais_min = []
+            
+            for mes in range(1, 13):
+                if mes <= len(df_max):
+                    valores_max, valores_min = [], []
+                    
+                    for col in df_max.columns:
+                        if isinstance(col, (int, float)) or (isinstance(col, str) and col.replace('.', '').isdigit()):
+                            try:
+                                val_max = df_max.iloc[mes, df_max.columns.get_loc(col)]
+                                val_min = df_min.iloc[mes, df_min.columns.get_loc(col)]
+                                if pd.notna(val_max) and isinstance(val_max, (int, float)): valores_max.append(float(val_max))
+                                if pd.notna(val_min) and isinstance(val_min, (int, float)): valores_min.append(float(val_min))
+                            except: continue
+                    
+                    if valores_max and valores_min:
+                        targets_mensais_max.append(sum(valores_max) / len(valores_max))
+                        targets_mensais_min.append(sum(valores_min) / len(valores_min))
+                    else:
+                        targets_mensais_max.append(500)
+                        targets_mensais_min.append(450)
+                else:
+                    targets_mensais_max.append(500)
+                    targets_mensais_min.append(450)
+            
+            targets_dict[usina_key] = {'max': targets_mensais_max, 'min': targets_mensais_min, 'potencia_ref': config['potencia_ref']}
+        
+        return targets_dict
+        
+    except Exception as e:
+        st.warning(f"Erro ao carregar targets: {e}")
+        return {'Riachão': {'max': [500] * 12, 'min': [450] * 12, 'potencia_ref': 118}, 'Xique-xique': {'max': [520] * 12, 'min': [470] * 12, 'potencia_ref': 118}}
+
+@st.cache_data
+def get_target_range_mensal(nome_usina, potencia_kwp, mes):
+    """Retorna o range (min, max) do target mensal para uma usina específica"""
+    targets_data = load_targets()
+    nome_lower = nome_usina.lower()
+    
+    if 'riachão' in nome_lower or 'riachao' in nome_lower or 'jacuipe' in nome_lower:
+        usina_key = 'Riachão'
+    elif 'xique' in nome_lower or 'poções' in nome_lower or 'pocoes' in nome_lower or 'domingos' in nome_lower:
+        usina_key = 'Xique-xique_132' if potencia_kwp and potencia_kwp >= 130 else 'Xique-xique'
+    elif any(local in nome_lower for local in ['itaguaçu', 'itaguacu', 'varzea', 'várzea']):
+        usina_key = 'Xique-xique'  # Sempre usar Xique-xique normal para Itaguaçu
+    else:
+        usina_key = 'Riachão'
+    
+    if usina_key and usina_key in targets_data:
+        target_info = targets_data[usina_key]
+        target_max = target_info['max'][mes-1] if mes <= len(target_info['max']) else 500
+        target_min = target_info['min'][mes-1] if mes <= len(target_info['min']) else 450
+        
+        if potencia_kwp and target_info['potencia_ref']:
+            fator_escala = potencia_kwp / target_info['potencia_ref']
+            target_max *= fator_escala
+            target_min *= fator_escala
+            
+        return target_min, target_max
+    
+    potencia_default = potencia_kwp or 100
+    return potencia_default * 4.5, potencia_default * 5.5
+
+@st.cache_data
+def calcular_targets_periodo(usinas_df, timestamps, fator_tempo=1):
+    """Calcula targets min e max para um período de tempo de forma otimizada"""
+    targets_min, targets_max = [], []
+    
+    for timestamp in timestamps:
+        mes_num = timestamp.month
+        target_total_min = target_total_max = 0
+        
+        for _, usina_row in usinas_df.iterrows():
+            nome_usina = usina_row['nome_usina']
+            potencia_usina = usina_row['potencia_pico_kwp']
+            target_min, target_max = get_target_range_mensal(nome_usina, potencia_usina, mes_num)
+            target_total_min += target_min * fator_tempo
+            target_total_max += target_max * fator_tempo
+        
+        targets_min.append(target_total_min)
+        targets_max.append(target_total_max)
+    
+    return targets_min, targets_max
 
 # --- FUNÇÕES DE BUSCA DE DADOS ---
 @st.cache_data(ttl=600) 
