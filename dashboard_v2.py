@@ -13,28 +13,16 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# ESTILIZAÇÃO CSS (IDENTIDADE VISUAL SOL ONLINE)
+# ESTILIZAÇÃO CSS
 # ==============================================================================
 st.markdown("""
 <style>
-    /* Sidebar Rosa */
-    [data-testid="stSidebar"] {
-        background-color: #E91E63;
-    }
-    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, 
-    [data-testid="stSidebar"] label, [data-testid="stSidebar"] .stMarkdown p,
-    [data-testid="stSidebar"] .stRadio label {
-        color: white !important;
-    }
+    [data-testid="stSidebar"] { background-color: #E91E63; }
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] label, [data-testid="stSidebar"] p { color: white !important; }
     [data-testid="stSidebar"] span { color: #f0f0f0; }
     [data-testid="stSidebar"] hr { border-color: rgba(255, 255, 255, 0.4) !important; }
-
-    /* Títulos e KPIs em Rosa */
-    h1, h2, h3, [data-testid="stMetricValue"] {
-        color: #E91E63 !important;
-    }
+    h1, h2, h3, [data-testid="stMetricValue"] { color: #E91E63 !important; }
     [data-testid="stMetricLabel"] { color: #555; }
-    
     :root { --primary-color: #00E676; }
 </style>
 """, unsafe_allow_html=True)
@@ -57,7 +45,6 @@ conn = init_connection()
 @st.cache_data(ttl=600)
 def get_usinas():
     if conn: 
-        # Traz também o perfil de target para usar nos cálculos
         return conn.query("""
             SELECT id_usina, nome_usina, fabricante_api, potencia_pico_kwp, target_profile 
             FROM tbl_usinas 
@@ -73,11 +60,11 @@ def get_inversores_por_usinas(lista_ids):
 @st.cache_data(ttl=300)
 def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     """
-    Busca dados de geração E dados de meta em uma única ida ao banco (ou duas otimizadas).
+    Busca dados de geração E targets (metas) do banco de forma otimizada.
     """
     if not lista_ids_inv or not conn: return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Dados de Geração (Leituras)
+    # 1. Geração
     q_gen = """
     SELECT l.timestamp_utc, l.potencia_ativa_kw, l.energia_intervalo_wh, i.nome_inversor, u.nome_usina, u.id_usina, u.target_profile, u.potencia_pico_kwp
     FROM tbl_leituras l
@@ -88,8 +75,7 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     LIMIT 150000;
     """
     
-    # 2. Dados de Meta (Targets)
-    # Busca apenas os perfis envolvidos no período selecionado
+    # 2. Targets
     q_target = """
     SELECT target_profile, data_referencia, val_min, val_max
     FROM tbl_targets
@@ -101,48 +87,32 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     try:
         df_gen = conn.query(q_gen, params={"ids": lista_ids_inv, "d_ini": data_ini, "d_fim": data_fim + timedelta(days=1)}, ttl=300)
         
-        # Se tiver geração, busca os targets correspondentes
         if not df_gen.empty:
-            perfis_unicos = df_gen['target_profile'].unique().tolist()
-            # Remove None/Null se houver
-            perfis_unicos = [p for p in perfis_unicos if p]
-            
-            if perfis_unicos:
-                df_targets = conn.query(q_target, params={"perfis": perfis_unicos, "d_ini": data_ini, "d_fim": data_fim}, ttl=3600)
+            perfis = [p for p in df_gen['target_profile'].unique() if p]
+            if perfis:
+                df_targets = conn.query(q_target, params={"perfis": perfis, "d_ini": data_ini, "d_fim": data_fim}, ttl=3600)
             else:
                 df_targets = pd.DataFrame()
         else:
             df_targets = pd.DataFrame()
             
         return df_gen, df_targets
-        
     except Exception as e:
-        st.error(f"Erro ao buscar dados: {e}")
+        st.error(f"Erro dados: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
 # ------------------------------------------------------------------
-# LÓGICA DE CÁLCULO DE META (USANDO O DATAFRAME DO BANCO)
+# CÁLCULO DE META (MODIFICADO: SEM ESCALA DE POTÊNCIA)
 # ------------------------------------------------------------------
-def get_meta_periodo(df_targets, usinas_df, data_range, fator_tempo=1):
-    """
-    Calcula as metas min/max somadas para um intervalo de datas,
-    usando o DataFrame de targets carregado do banco.
-    """
+def get_meta_periodo(df_targets, usinas_df, data_range):
     if df_targets.empty or usinas_df.empty:
         return [0]*len(data_range), [0]*len(data_range)
     
-    # Pré-processamento: Indexar targets por (perfil, data) para busca rápida
-    # Converte data_referencia para string ou date para garantir match
+    # Mapa de Targets: {(Perfil, Data): {min, max}}
     df_targets['data_str'] = pd.to_datetime(df_targets['data_referencia']).dt.date
     target_map = df_targets.set_index(['target_profile', 'data_str'])[['val_min', 'val_max']].to_dict('index')
     
-    # Dicionário de Usinas: {Nome: {Perfil, Potencia}}
     usinas_map = usinas_df.set_index('nome_usina')[['target_profile', 'potencia_pico_kwp']].to_dict('index')
-    
-    # Referências de Potência (Hardcoded pois são fixas do projeto)
-    ref_pot = {
-        'Riachão': 118, 'Xique-xique': 118, 'Xique-xique_132': 132
-    }
     
     lista_min, lista_max = [], []
     
@@ -151,30 +121,23 @@ def get_meta_periodo(df_targets, usinas_df, data_range, fator_tempo=1):
         soma_min, soma_max = 0, 0
         
         for nome_usina, info in usinas_map.items():
-            perfil = info.get('target_profile', 'Xique-xique') # Default
-            pot_usina = info.get('potencia_pico_kwp', 100)
+            perfil = info.get('target_profile', 'Xique-xique')
             
-            # Busca target base do banco
+            # Busca valor exato do banco/Excel
             vals = target_map.get((perfil, dia_date))
             
             if vals:
-                t_min_base = vals['val_min']
-                t_max_base = vals['val_max']
+                # --- ALTERAÇÃO AQUI: USA O VALOR BRUTO DO EXCEL ---
+                # Se quiser voltar a escalar, descomente as linhas abaixo:
+                # pot_ref = 132 if '132' in perfil else 118
+                # fator = info.get('potencia_pico_kwp', 100) / pot_ref
+                # t_min = vals['val_min'] * fator
+                # t_max = vals['val_max'] * fator
                 
-                # Escala pela potência
-                pot_ref = ref_pot.get(perfil, 118)
-                fator_escala = pot_usina / pot_ref if pot_ref > 0 else 1
-                
-                t_min = t_min_base * fator_escala
-                t_max = t_max_base * fator_escala
+                t_min = vals['val_min'] # Valor puro
+                t_max = vals['val_max'] # Valor puro
             else:
-                # Fallback se não tiver meta cadastrada no dia
-                t_min, t_max = 0, 0 
-            
-            # Fator de tempo (ex: mensal = multiplica por dias do mês? Não, aqui já somamos dia a dia)
-            # A lógica de "fator_tempo" era para quando não tínhamos dados diários.
-            # Agora temos. Se o gráfico for mensal, o resample vai somar.
-            # Se a função for chamada para um dia, retorna o valor do dia.
+                t_min, t_max = 0, 0
             
             soma_min += t_min
             soma_max += t_max
@@ -198,7 +161,6 @@ st.sidebar.title("Filtros")
 if conn:
     usinas_df = get_usinas()
     if not usinas_df.empty:
-        # Filtros
         sel_usinas = st.sidebar.multiselect("Usinas:", usinas_df['nome_usina'].unique(), default=usinas_df['nome_usina'].iloc[0])
         if not sel_usinas: st.stop()
         
@@ -214,11 +176,8 @@ if conn:
         d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
         d_fim = st.sidebar.date_input("Fim", hoje)
 
-        # LOAD DATA
         with st.spinner("Carregando dados..."):
-            # Busca Geração E Targets do banco
             main_df, targets_db_df = get_dados_completos(ids_inv_finais, usinas_sel_df['target_profile'].unique().tolist(), d_ini, d_fim)
-            
             if not main_df.empty:
                 main_df['ts'] = pd.to_datetime(main_df['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
                 main_df_indexed = main_df.set_index('ts')
@@ -232,17 +191,14 @@ if conn:
             st.title("Resumo Gerencial")
             if not main_df_indexed.empty:
                 total_gerado = main_df_indexed['energia_intervalo_wh'].sum() / 1000.0
-                
-                # Calcula meta para o período todo (soma diária)
                 dias_range = pd.date_range(d_ini, d_fim)
                 kpi_min, kpi_max = get_meta_periodo(targets_db_df, usinas_sel_df, dias_range)
                 meta_total = (sum(kpi_min) + sum(kpi_max)) / 2
-                
                 perf = (total_gerado / meta_total * 100) if meta_total > 0 else 0
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Gerado", f"{total_gerado:,.0f} kWh".replace(',', '.'))
-                c2.metric("Meta", f"{meta_total:,.0f} kWh".replace(',', '.'))
+                c2.metric("Meta (Ref)", f"{meta_total:,.0f} kWh".replace(',', '.'))
                 c3.metric("Perf.", f"{perf:.1f}%")
                 st.divider()
 
@@ -257,43 +213,30 @@ if conn:
 
                 # Mensal
                 df_mes = main_df_indexed.resample('ME')['energia_intervalo_wh'].sum() / 1000.0
-                # Meta Mensal: Re-agrega os dados diários por mês
-                # Truque: Criar um DF temporário com as metas diárias e resamplear
-                df_meta_diaria = pd.DataFrame({'data': dias_range, 'min': kpi_min, 'max': kpi_max}).set_index('data')
-                df_meta_mes = df_meta_diaria.resample('ME').sum()
+                fig_m = go.Figure(go.Bar(x=df_mes.index.strftime('%b/%y'), y=df_mes.values, marker_color='#00E676', name='Realizado'))
                 
-                # Alinha índices (apenas meses que existem na geração ou no range)
-                # (Simplificação: usa o índice do df_mes gerado)
-                # Para garantir alinhamento visual, plotamos metas apenas onde tem mês
-                
-                fig_m = go.Figure()
-                fig_m.add_trace(go.Bar(x=df_mes.index.strftime('%b/%y'), y=df_mes.values, marker_color='#00E676', name='Realizado'))
-                
-                # Plota Meta Mensal (Somada)
-                # Precisa recalcular meta para os meses do gráfico
-                m_min_lista, m_max_lista = [], []
-                for m_date in df_mes.index:
-                    # Pega o último dia do mês ou o range
-                    # Forma mais segura: filtrar df_meta_mes pelo índice
-                    try:
-                        # Encontra o mês correspondente no df_meta_mes (aproximação por ano/mês)
-                        # Como ambos são 'ME' (Month End), devem bater
-                        val = df_meta_mes.loc[m_date]
-                        m_min_lista.append(val['min'])
-                        m_max_lista.append(val['max'])
-                    except:
-                        m_min_lista.append(0); m_max_lista.append(0)
+                # Meta Mensal (Soma das metas diárias)
+                # Recalcula para todo o range dos meses exibidos
+                if not df_mes.empty:
+                    m_start = df_mes.index.min() - pd.offsets.MonthBegin(1)
+                    m_end = df_mes.index.max() + pd.offsets.MonthEnd(0)
+                    r_mes = pd.date_range(m_start, m_end)
+                    dm_min, dm_max = get_meta_periodo(targets_db_df, usinas_sel_df, r_mes)
+                    
+                    # Agrupa por mês
+                    df_m_temp = pd.DataFrame({'min': dm_min, 'max': dm_max}, index=r_mes).resample('ME').sum()
+                    # Filtra apenas meses do gráfico
+                    df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
+                    
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], mode='lines', line=dict(width=0), showlegend=False))
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.2)', line=dict(color='rgba(233,30,99,0.8)', dash='dot'), name='Meta'))
 
-                fig_m.add_trace(go.Scatter(x=df_mes.index.strftime('%b/%y'), y=m_max_lista, mode='lines', line=dict(width=0), showlegend=False))
-                fig_m.add_trace(go.Scatter(x=df_mes.index.strftime('%b/%y'), y=m_min_lista, mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.2)', line=dict(color='rgba(233,30,99,0.8)', dash='dot'), name='Meta'))
                 fig_m.update_layout(title="Energia Mensal", height=300)
                 col_m.plotly_chart(fig_m, use_container_width=True)
 
                 # Diário
                 st.subheader("Diário")
                 df_d = main_df_indexed.resample('D')['energia_intervalo_wh'].sum() / 1000.0
-                # Meta Diária já calculada em kpi_min/max, basta filtrar para os dias com dados ou range
-                # Vamos re-calcular para o índice exato do gráfico para garantir alinhamento
                 t_d_min, t_d_max = get_meta_periodo(targets_db_df, usinas_sel_df, df_d.index)
                 
                 fig_d = go.Figure()
@@ -321,39 +264,28 @@ if conn:
                 if agrup == "Inversor": df_tec['nome_inversor'] = df_tec['nome_usina'] + ' - ' + df_tec['nome_inversor']
                 
                 df_res = df_tec.groupby([pd.Grouper(freq=rule), grp])['energia_intervalo_wh'].sum().unstack(level=grp).fillna(0) / 1000.0
-                df_res.index = df_res.index.strftime(fmt) # String para plot
+                df_res.index = df_res.index.strftime(fmt)
 
                 fig = go.Figure()
                 
-                # Índice original de datas para calcular meta
-                datas_originais = df_tec.groupby([pd.Grouper(freq=rule)]).first().index
+                # Range completo para cálculo de meta
+                idx_dates = df_tec.groupby([pd.Grouper(freq=rule)]).first().index
 
                 for i, col_name in enumerate(df_res.columns):
                     color = SOL_COLORS[i % len(SOL_COLORS)]
                     fig.add_trace(go.Bar(x=df_res.index, y=df_res[col_name], name=col_name, marker_color=color))
                     
                     if meta_on and agrup == "Usina":
-                        # Calcula meta para ESTA usina
                         u_info = usinas_sel_df[usinas_sel_df['nome_usina'] == col_name]
                         if not u_info.empty:
-                            # Se for diário, pega meta do dia. Se mensal, soma do mês.
-                            # get_meta_periodo retorna meta DIÁRIA para uma lista de dias.
-                            # Se a visão é MENSAL, precisamos somar.
-                            
                             if visao == "Diário":
-                                tm_min, tm_max = get_meta_periodo(targets_db_df, u_info, datas_originais)
+                                tm_min, tm_max = get_meta_periodo(targets_db_df, u_info, idx_dates)
                             else:
-                                # Lógica para mensal: Calcular dia a dia de cada mês e somar
-                                # Complexo? Simplificação:
-                                # Cria range de todos os dias do período, calcula meta dia a dia, depois resample
-                                full_range = pd.date_range(datas_originais.min(), datas_originais.max() + pd.offsets.MonthEnd(0))
+                                full_range = pd.date_range(idx_dates.min(), idx_dates.max() + pd.offsets.MonthEnd(0))
                                 d_min, d_max = get_meta_periodo(targets_db_df, u_info, full_range)
-                                df_temp = pd.DataFrame({'min': d_min, 'max': d_max}, index=full_range)
-                                df_temp_res = df_temp.resample('ME').sum()
-                                # Filtra apenas os meses que estão no gráfico
-                                # (Assumindo alinhamento pelo índice de datas_originais que são ME)
-                                tm_min = df_temp_res.loc[datas_originais]['min'].values
-                                tm_max = df_temp_res.loc[datas_originais]['max'].values
+                                df_t = pd.DataFrame({'min': d_min, 'max': d_max}, index=full_range).resample('ME').sum()
+                                df_t = df_t.loc[df_t.index.intersection(idx_dates)]
+                                tm_min, tm_max = df_t['min'], df_t['max']
 
                             fig.add_trace(go.Scatter(x=df_res.index, y=tm_max, mode='lines', line=dict(color=color, width=0), showlegend=False, hoverinfo='skip'))
                             fig.add_trace(go.Scatter(x=df_res.index, y=tm_min, mode='lines', line=dict(color=color, width=2, dash='dot'), fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.2,)}", name=f"Meta {col_name}"))
@@ -370,9 +302,8 @@ if conn:
             metr = c1.selectbox("Métrica", ["Potência (kW)", "Energia (kWh)"])
             
             fig_c = go.Figure()
-            # Loop simples para buscar e plotar
             for i, d in enumerate(datas):
-                dd, _ = get_dados_completos(ids_inv_finais, [], d, d) # Targets vazio aqui
+                dd, _ = get_dados_completos(ids_inv_finais, [], d, d)
                 if dd.empty: continue
                 dd['ts'] = pd.to_datetime(dd['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
                 agg = dd.groupby('ts').agg({'potencia_ativa_kw':'sum', 'energia_intervalo_wh':'sum'}).reset_index()
