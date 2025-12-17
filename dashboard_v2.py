@@ -60,7 +60,7 @@ def get_inversores_por_usinas(lista_ids):
 @st.cache_data(ttl=300)
 def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     """
-    Busca dados de geração E targets (metas) do banco de forma otimizada.
+    Busca dados de geração E targets do banco.
     """
     if not lista_ids_inv or not conn: return pd.DataFrame(), pd.DataFrame()
     
@@ -75,7 +75,7 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     LIMIT 150000;
     """
     
-    # 2. Targets
+    # 2. Targets (Direto da tabela tbl_targets)
     q_target = """
     SELECT target_profile, data_referencia, val_min, val_max
     FROM tbl_targets
@@ -102,13 +102,13 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
         return pd.DataFrame(), pd.DataFrame()
 
 # ------------------------------------------------------------------
-# CÁLCULO DE META (MODIFICADO: SEM ESCALA DE POTÊNCIA)
+# CÁLCULO DE META (VALOR PURO - SEM ESCALA)
 # ------------------------------------------------------------------
 def get_meta_periodo(df_targets, usinas_df, data_range):
     if df_targets.empty or usinas_df.empty:
         return [0]*len(data_range), [0]*len(data_range)
     
-    # Mapa de Targets: {(Perfil, Data): {min, max}}
+    # Mapa de Targets para busca rápida
     df_targets['data_str'] = pd.to_datetime(df_targets['data_referencia']).dt.date
     target_map = df_targets.set_index(['target_profile', 'data_str'])[['val_min', 'val_max']].to_dict('index')
     
@@ -123,19 +123,13 @@ def get_meta_periodo(df_targets, usinas_df, data_range):
         for nome_usina, info in usinas_map.items():
             perfil = info.get('target_profile', 'Xique-xique')
             
-            # Busca valor exato do banco/Excel
             vals = target_map.get((perfil, dia_date))
             
             if vals:
-                # --- ALTERAÇÃO AQUI: USA O VALOR BRUTO DO EXCEL ---
-                # Se quiser voltar a escalar, descomente as linhas abaixo:
-                # pot_ref = 132 if '132' in perfil else 118
-                # fator = info.get('potencia_pico_kwp', 100) / pot_ref
-                # t_min = vals['val_min'] * fator
-                # t_max = vals['val_max'] * fator
-                
-                t_min = vals['val_min'] # Valor puro
-                t_max = vals['val_max'] # Valor puro
+                # --- AQUI ESTÁ A CORREÇÃO ---
+                # Usa o valor exato do banco, sem multiplicar pela potência
+                t_min = vals['val_min'] 
+                t_max = vals['val_max'] 
             else:
                 t_min, t_max = 0, 0
             
@@ -198,7 +192,7 @@ if conn:
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Gerado", f"{total_gerado:,.0f} kWh".replace(',', '.'))
-                c2.metric("Meta (Ref)", f"{meta_total:,.0f} kWh".replace(',', '.'))
+                c2.metric("Meta", f"{meta_total:,.0f} kWh".replace(',', '.'))
                 c3.metric("Perf.", f"{perf:.1f}%")
                 st.divider()
 
@@ -215,17 +209,13 @@ if conn:
                 df_mes = main_df_indexed.resample('ME')['energia_intervalo_wh'].sum() / 1000.0
                 fig_m = go.Figure(go.Bar(x=df_mes.index.strftime('%b/%y'), y=df_mes.values, marker_color='#00E676', name='Realizado'))
                 
-                # Meta Mensal (Soma das metas diárias)
-                # Recalcula para todo o range dos meses exibidos
                 if not df_mes.empty:
                     m_start = df_mes.index.min() - pd.offsets.MonthBegin(1)
                     m_end = df_mes.index.max() + pd.offsets.MonthEnd(0)
                     r_mes = pd.date_range(m_start, m_end)
                     dm_min, dm_max = get_meta_periodo(targets_db_df, usinas_sel_df, r_mes)
                     
-                    # Agrupa por mês
                     df_m_temp = pd.DataFrame({'min': dm_min, 'max': dm_max}, index=r_mes).resample('ME').sum()
-                    # Filtra apenas meses do gráfico
                     df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
                     
                     fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], mode='lines', line=dict(width=0), showlegend=False))
@@ -268,7 +258,6 @@ if conn:
 
                 fig = go.Figure()
                 
-                # Range completo para cálculo de meta
                 idx_dates = df_tec.groupby([pd.Grouper(freq=rule)]).first().index
 
                 for i, col_name in enumerate(df_res.columns):
