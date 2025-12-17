@@ -59,12 +59,8 @@ def get_inversores_por_usinas(lista_ids):
 
 @st.cache_data(ttl=300)
 def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
-    """
-    Busca dados de geração E targets do banco.
-    """
     if not lista_ids_inv or not conn: return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Geração
     q_gen = """
     SELECT l.timestamp_utc, l.potencia_ativa_kw, l.energia_intervalo_wh, i.nome_inversor, u.nome_usina, u.id_usina, u.target_profile, u.potencia_pico_kwp
     FROM tbl_leituras l
@@ -75,7 +71,6 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     LIMIT 150000;
     """
     
-    # 2. Targets (Direto da tabela tbl_targets)
     q_target = """
     SELECT target_profile, data_referencia, val_min, val_max
     FROM tbl_targets
@@ -108,10 +103,9 @@ def get_meta_periodo(df_targets, usinas_df, data_range):
     if df_targets.empty or usinas_df.empty:
         return [0]*len(data_range), [0]*len(data_range)
     
-    # Mapa de Targets para busca rápida
+    # Mapa de Targets
     df_targets['data_str'] = pd.to_datetime(df_targets['data_referencia']).dt.date
     target_map = df_targets.set_index(['target_profile', 'data_str'])[['val_min', 'val_max']].to_dict('index')
-    
     usinas_map = usinas_df.set_index('nome_usina')[['target_profile', 'potencia_pico_kwp']].to_dict('index')
     
     lista_min, lista_max = [], []
@@ -122,12 +116,10 @@ def get_meta_periodo(df_targets, usinas_df, data_range):
         
         for nome_usina, info in usinas_map.items():
             perfil = info.get('target_profile', 'Xique-xique')
-            
             vals = target_map.get((perfil, dia_date))
             
             if vals:
-                # --- AQUI ESTÁ A CORREÇÃO ---
-                # Usa o valor exato do banco, sem multiplicar pela potência
+                # Usa valor BRUTO do banco (sem escala de potência)
                 t_min = vals['val_min'] 
                 t_max = vals['val_max'] 
             else:
@@ -186,14 +178,25 @@ if conn:
             if not main_df_indexed.empty:
                 total_gerado = main_df_indexed['energia_intervalo_wh'].sum() / 1000.0
                 dias_range = pd.date_range(d_ini, d_fim)
-                kpi_min, kpi_max = get_meta_periodo(targets_db_df, usinas_sel_df, dias_range)
-                meta_total = (sum(kpi_min) + sum(kpi_max)) / 2
-                perf = (total_gerado / meta_total * 100) if meta_total > 0 else 0
+                
+                # Lista de metas diárias
+                lista_meta_min, lista_meta_max = get_meta_periodo(targets_db_df, usinas_sel_df, dias_range)
+                
+                # SOMA TOTAL DO PERÍODO
+                total_meta_min = sum(lista_meta_min)
+                total_meta_max = sum(lista_meta_max)
+                
+                # Performance baseada na média do range
+                meta_media = (total_meta_min + total_meta_max) / 2
+                perf = (total_gerado / meta_media * 100) if meta_media > 0 else 0
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Gerado", f"{total_gerado:,.0f} kWh".replace(',', '.'))
-                c2.metric("Meta", f"{meta_total:,.0f} kWh".replace(',', '.'))
-                c3.metric("Perf.", f"{perf:.1f}%")
+                # --- 4 COLUNAS DE KPI ---
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Gerado Total", f"{total_gerado:,.0f} kWh".replace(',', '.'))
+                c2.metric("Meta Mínima", f"{total_meta_min:,.0f} kWh".replace(',', '.'))
+                c3.metric("Meta Máxima", f"{total_meta_max:,.0f} kWh".replace(',', '.'))
+                c4.metric("Performance", f"{perf:.1f}%")
+                
                 st.divider()
 
                 col_a, col_m = st.columns(2)
@@ -219,7 +222,7 @@ if conn:
                     df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
                     
                     fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], mode='lines', line=dict(width=0), showlegend=False))
-                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.2)', line=dict(color='rgba(233,30,99,0.8)', dash='dot'), name='Meta'))
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.2)', line=dict(color='rgba(233,30,99,0.8)', dash='dot'), name='Meta Range'))
 
                 fig_m.update_layout(title="Energia Mensal", height=300)
                 col_m.plotly_chart(fig_m, use_container_width=True)
@@ -232,7 +235,7 @@ if conn:
                 fig_d = go.Figure()
                 fig_d.add_trace(go.Bar(x=df_d.index.strftime('%d/%m'), y=df_d.values, marker_color='#00E676', name='Realizado'))
                 fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_max, mode='lines', line=dict(width=0), showlegend=False))
-                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_min, mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.2)', line=dict(color='rgba(233,30,99,0.8)', dash='dot'), name='Meta'))
+                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_min, mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.2)', line=dict(color='rgba(233,30,99,0.8)', dash='dot'), name='Meta Range'))
                 fig_d.update_layout(height=400, hovermode="x unified")
                 st.plotly_chart(fig_d, use_container_width=True)
             else: st.info("Sem dados.")
@@ -257,7 +260,6 @@ if conn:
                 df_res.index = df_res.index.strftime(fmt)
 
                 fig = go.Figure()
-                
                 idx_dates = df_tec.groupby([pd.Grouper(freq=rule)]).first().index
 
                 for i, col_name in enumerate(df_res.columns):
