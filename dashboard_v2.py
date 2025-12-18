@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date, time
 import plotly.graph_objects as go
 import plotly.express as px
 import pytz 
-import numpy as np # Importante para empilhar dados no gráfico
+import numpy as np 
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -208,8 +208,18 @@ if conn:
                 # ANUAL
                 df_ano = main_df_indexed.resample('YE')['energia_intervalo_wh'].sum() / 1000.0
                 df_ano.index = df_ano.index.strftime('%Y')
-                fig_a = go.Figure(go.Bar(x=df_ano.index, y=df_ano.values, text=[f"{v:,.0f}" for v in df_ano.values], textposition='auto', marker_color='#00E676', name='Realizado'))
-                fig_a.update_layout(title="Energia Anual", height=300)
+                
+                fig_a = go.Figure(go.Bar(
+                    x=df_ano.index, 
+                    y=df_ano.values, 
+                    text=[f"{v:,.0f}" for v in df_ano.values], 
+                    textposition='auto', 
+                    marker_color='#00E676', 
+                    name='Realizado'
+                ))
+                
+                # CORREÇÃO AQUI: xaxis=dict(type='category')
+                fig_a.update_layout(title="Energia Anual", height=300, xaxis=dict(type='category'))
                 col_a.plotly_chart(fig_a, use_container_width=True)
 
                 # MENSAL
@@ -225,10 +235,9 @@ if conn:
                     df_m_temp = pd.DataFrame({'min': dm_min, 'max': dm_max}, index=r_mes).resample('ME').sum()
                     df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
                     
-                    # Hover Template Rico para Mensal
+                    # Hover Template Rico
                     hover_m = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
                     
-                    # Atualiza a barra com dados de meta para o hover
                     fig_m.update_traces(
                         customdata=np.stack((df_m_final['min'], df_m_final['max']), axis=-1),
                         hovertemplate=hover_m
@@ -246,8 +255,6 @@ if conn:
                 t_d_min, t_d_max = get_meta_periodo(targets_db_df, usinas_sel_df, df_d.index)
                 
                 fig_d = go.Figure()
-                
-                # Hover rico para Diário
                 hover_d = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
                 
                 fig_d.add_trace(go.Bar(
@@ -266,7 +273,7 @@ if conn:
                 st.plotly_chart(fig_d, use_container_width=True)
             else: st.info("Sem dados.")
 
-        # === ABA 2: TÉCNICA (ATUALIZADA) ===
+        # === ABA 2: TÉCNICA ===
         with tab2:
             st.title("Análise Técnica")
             c1, c2, c3 = st.columns([1,1,2])
@@ -290,10 +297,8 @@ if conn:
 
                 for i, col_name in enumerate(df_res.columns):
                     color = SOL_COLORS[i % len(SOL_COLORS)]
-                    
-                    # Lógica para calcular meta individual da usina
                     custom_meta_data = None
-                    hover_template_str = "<b>%{x}</b><br>⚡ %{y:,.0f} kWh<extra></extra>" # Default simples
+                    hover_template_str = "<b>%{x}</b><br>⚡ %{y:,.0f} kWh<extra></extra>"
                     
                     if meta_on and agrup == "Usina":
                         u_info = usinas_sel_df[usinas_sel_df['nome_usina'] == col_name]
@@ -307,15 +312,12 @@ if conn:
                                 df_t = df_t.loc[df_t.index.intersection(idx_dates)]
                                 tm_min, tm_max = df_t['min'], df_t['max']
                             
-                            # Prepara dados para o hover
                             custom_meta_data = np.stack((tm_min, tm_max), axis=-1)
                             hover_template_str = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
                             
-                            # Desenha linhas de meta
                             fig.add_trace(go.Scatter(x=df_res.index, y=tm_max, mode='lines', line=dict(color=color, width=1, dash='dash'), name=f"{col_name} (Max)", showlegend=False, hoverinfo='skip'))
                             fig.add_trace(go.Scatter(x=df_res.index, y=tm_min, mode='lines', line=dict(color=color, width=1, dash='dot'), fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.1,)}", name=f"{col_name} (Min)", showlegend=False, hoverinfo='skip'))
                     
-                    # Desenha a Barra com o Hover Rico
                     fig.add_trace(go.Bar(
                         x=df_res.index, 
                         y=df_res[col_name], 
@@ -328,7 +330,6 @@ if conn:
                 fig.update_layout(barmode='group', height=500, title="Energia (kWh)", hovermode="closest")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # === CURVA DE POTÊNCIA (RECUPERADO) ===
                 if visao == "Diário":
                     st.divider()
                     st.subheader("Curva de Potência (kW)")
