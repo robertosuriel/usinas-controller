@@ -59,13 +59,9 @@ def get_inversores_por_usinas(lista_ids):
 
 @st.cache_data(ttl=300)
 def get_dados_completos(lista_ids_inv, lista_perfis, dt_ini_utc, dt_fim_utc, date_ini_br, date_fim_br):
-    """
-    Busca dados usando timestamps UTC exatos para Geração
-    e Datas BR exatas para Targets.
-    """
     if not lista_ids_inv or not conn: return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Geração (Usa UTC calculado para pegar o dia exato no Brasil)
+    # 1. Geração
     q_gen = """
     SELECT l.timestamp_utc, l.potencia_ativa_kw, l.energia_intervalo_wh, i.nome_inversor, u.nome_usina, u.id_usina, u.target_profile, u.potencia_pico_kwp
     FROM tbl_leituras l
@@ -76,7 +72,7 @@ def get_dados_completos(lista_ids_inv, lista_perfis, dt_ini_utc, dt_fim_utc, dat
     LIMIT 150000;
     """
     
-    # 2. Targets (Usa a data "humana" selecionada no filtro)
+    # 2. Targets
     q_target = """
     SELECT target_profile, data_referencia, val_min, val_max
     FROM tbl_targets
@@ -91,7 +87,6 @@ def get_dados_completos(lista_ids_inv, lista_perfis, dt_ini_utc, dt_fim_utc, dat
         if not df_gen.empty:
             perfis = [p for p in df_gen['target_profile'].unique() if p]
             if perfis:
-                # Passamos as datas BR originais para garantir que pegue o target do dia certo
                 df_targets = conn.query(q_target, params={"perfis": perfis, "d_ini_date": date_ini_br, "d_fim_date": date_fim_br}, ttl=3600)
             else:
                 df_targets = pd.DataFrame()
@@ -123,7 +118,6 @@ def get_meta_periodo(df_targets, usinas_df, data_range):
         for nome_usina, info in usinas_map.items():
             perfil = info.get('target_profile', 'Xique-xique')
             vals = target_map.get((perfil, dia_date))
-            
             if vals:
                 soma_min += vals['val_min']
                 soma_max += vals['val_max']
@@ -162,20 +156,15 @@ if conn:
         d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
         d_fim = st.sidebar.date_input("Fim", hoje)
 
-        # --- CORREÇÃO DE TIMEZONE (O SEGREDO!) ---
+        # Timezone Correction
         tz_br = pytz.timezone('America/Sao_Paulo')
-        
-        # Início: 00:00 do dia selecionado (Horário Brasil) -> Converte para UTC
-        dt_ini_br = datetime.combine(d_ini, time.min) # 00:00:00
+        dt_ini_br = datetime.combine(d_ini, time.min)
         dt_ini_br = tz_br.localize(dt_ini_br)
         dt_ini_utc = dt_ini_br.astimezone(pytz.utc)
         
-        # Fim: 23:59:59 do dia selecionado (ou 00:00 do dia seguinte)
-        # Usamos 00:00 do dia seguinte para garantir que pegue o dia inteiro com operador <
         dt_fim_br = datetime.combine(d_fim + timedelta(days=1), time.min)
         dt_fim_br = tz_br.localize(dt_fim_br)
         dt_fim_utc = dt_fim_br.astimezone(pytz.utc)
-        # ------------------------------------------
 
         with st.spinner("Carregando dados..."):
             main_df, targets_db_df = get_dados_completos(
@@ -183,18 +172,18 @@ if conn:
                 usinas_sel_df['target_profile'].unique().tolist(), 
                 dt_ini_utc, 
                 dt_fim_utc,
-                d_ini, # Passa data original para filtrar targets
+                d_ini,
                 d_fim
             )
             
             if not main_df.empty:
-                # Converte UTC do banco de volta para Brasil para plotar
                 main_df['ts'] = pd.to_datetime(main_df['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
                 main_df_indexed = main_df.set_index('ts')
             else:
                 main_df_indexed = pd.DataFrame()
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumo", "📈 Técnica", "🔎 Comparação", "⚡ Status"])
+        # === NOMES DAS ABAS COMPLETOS (RECUPERADO) ===
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumo Gerencial", "📈 Análise Técnica", "🔎 Comparação", "⚡ Status"])
 
         # === ABA 1: RESUMO ===
         with tab1:
@@ -275,6 +264,7 @@ if conn:
                 df_tec = main_df_indexed.copy()
                 if agrup == "Inversor": df_tec['nome_inversor'] = df_tec['nome_usina'] + ' - ' + df_tec['nome_inversor']
                 
+                # Gráfico de Barras (Energia)
                 df_res = df_tec.groupby([pd.Grouper(freq=rule), grp])['energia_intervalo_wh'].sum().unstack(level=grp).fillna(0) / 1000.0
                 df_res.index = df_res.index.strftime(fmt)
 
@@ -300,8 +290,29 @@ if conn:
                             fig.add_trace(go.Scatter(x=df_res.index, y=tm_max, mode='lines', line=dict(color=color, width=1, dash='dash'), name=f"{col_name} (Max)", showlegend=True))
                             fig.add_trace(go.Scatter(x=df_res.index, y=tm_min, mode='lines', line=dict(color=color, width=1, dash='dot'), fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.1,)}", name=f"{col_name} (Min)", showlegend=True))
 
-                fig.update_layout(barmode='group', height=500)
+                fig.update_layout(barmode='group', height=500, title="Energia (kWh)")
                 st.plotly_chart(fig, use_container_width=True)
+
+                # === CURVA DE POTÊNCIA (RECUPERADO) ===
+                if visao == "Diário":
+                    st.divider()
+                    st.subheader("Curva de Potência (kW)")
+                    
+                    # Pivot para ter colunas por usina/inversor e índice por timestamp
+                    df_pot = df_tec.pivot_table(index='ts', columns=grp, values='potencia_ativa_kw', aggfunc='sum')
+                    
+                    fig_l = go.Figure()
+                    for i, col in enumerate(df_pot.columns): 
+                        fig_l.add_trace(go.Scatter(
+                            x=df_pot.index, 
+                            y=df_pot[col], 
+                            mode='lines', 
+                            name=col, 
+                            line=dict(color=SOL_COLORS[i % len(SOL_COLORS)])
+                        ))
+                    
+                    fig_l.update_layout(hovermode="x unified", height=450, xaxis_title="Horário", yaxis_title="Potência (kW)")
+                    st.plotly_chart(fig_l, use_container_width=True)
 
         # === ABA 3: COMPARAÇÃO ===
         with tab3:
@@ -313,7 +324,7 @@ if conn:
             
             fig_c = go.Figure()
             for i, d in enumerate(datas):
-                # Conversão Timezone manual aqui também
+                # Conversão Timezone manual
                 d_br = datetime.combine(d, time.min)
                 d_ini_utc = tz_br.localize(d_br).astimezone(pytz.utc)
                 d_fim_utc = tz_br.localize(datetime.combine(d + timedelta(days=1), time.min)).astimezone(pytz.utc)
