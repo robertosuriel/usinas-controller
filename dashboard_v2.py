@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, date, time
 import plotly.graph_objects as go
 import plotly.express as px
 import pytz 
+import numpy as np # Importante para empilhar dados no gráfico
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -61,7 +62,6 @@ def get_inversores_por_usinas(lista_ids):
 def get_dados_completos(lista_ids_inv, lista_perfis, dt_ini_utc, dt_fim_utc, date_ini_br, date_fim_br):
     if not lista_ids_inv or not conn: return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Geração
     q_gen = """
     SELECT l.timestamp_utc, l.potencia_ativa_kw, l.energia_intervalo_wh, i.nome_inversor, u.nome_usina, u.id_usina, u.target_profile, u.potencia_pico_kwp
     FROM tbl_leituras l
@@ -72,7 +72,6 @@ def get_dados_completos(lista_ids_inv, lista_perfis, dt_ini_utc, dt_fim_utc, dat
     LIMIT 150000;
     """
     
-    # 2. Targets
     q_target = """
     SELECT target_profile, data_referencia, val_min, val_max
     FROM tbl_targets
@@ -156,7 +155,6 @@ if conn:
         d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
         d_fim = st.sidebar.date_input("Fim", hoje)
 
-        # Timezone Correction
         tz_br = pytz.timezone('America/Sao_Paulo')
         dt_ini_br = datetime.combine(d_ini, time.min)
         dt_ini_br = tz_br.localize(dt_ini_br)
@@ -182,7 +180,6 @@ if conn:
             else:
                 main_df_indexed = pd.DataFrame()
 
-        # === NOMES DAS ABAS COMPLETOS (RECUPERADO) ===
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumo Gerencial", "📈 Análise Técnica", "🔎 Comparação", "⚡ Status"])
 
         # === ABA 1: RESUMO ===
@@ -228,10 +225,19 @@ if conn:
                     df_m_temp = pd.DataFrame({'min': dm_min, 'max': dm_max}, index=r_mes).resample('ME').sum()
                     df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
                     
-                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], mode='lines', line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), name='Meta Máxima', showlegend=True))
-                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.1)', line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), name='Meta Mínima', showlegend=True))
+                    # Hover Template Rico para Mensal
+                    hover_m = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
+                    
+                    # Atualiza a barra com dados de meta para o hover
+                    fig_m.update_traces(
+                        customdata=np.stack((df_m_final['min'], df_m_final['max']), axis=-1),
+                        hovertemplate=hover_m
+                    )
+                    
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], mode='lines', line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), name='Meta Máxima', showlegend=True, hoverinfo='skip'))
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.1)', line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), name='Meta Mínima', showlegend=True, hoverinfo='skip'))
 
-                fig_m.update_layout(title="Energia Mensal", height=300, hovermode="x unified")
+                fig_m.update_layout(title="Energia Mensal", height=300, hovermode="closest")
                 col_m.plotly_chart(fig_m, use_container_width=True)
 
                 # DIÁRIO
@@ -240,15 +246,27 @@ if conn:
                 t_d_min, t_d_max = get_meta_periodo(targets_db_df, usinas_sel_df, df_d.index)
                 
                 fig_d = go.Figure()
-                fig_d.add_trace(go.Bar(x=df_d.index.strftime('%d/%m'), y=df_d.values, marker_color='#00E676', name='Realizado'))
-                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_max, mode='lines', line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), name='Meta Máxima', showlegend=True))
-                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_min, mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.1)', line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), name='Meta Mínima', showlegend=True))
                 
-                fig_d.update_layout(height=400, hovermode="x unified")
+                # Hover rico para Diário
+                hover_d = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
+                
+                fig_d.add_trace(go.Bar(
+                    x=df_d.index.strftime('%d/%m'), 
+                    y=df_d.values, 
+                    marker_color='#00E676', 
+                    name='Realizado',
+                    customdata=np.stack((t_d_min, t_d_max), axis=-1),
+                    hovertemplate=hover_d
+                ))
+                
+                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_max, mode='lines', line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), name='Meta Máxima', showlegend=True, hoverinfo='skip'))
+                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_min, mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.1)', line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), name='Meta Mínima', showlegend=True, hoverinfo='skip'))
+                
+                fig_d.update_layout(height=400, hovermode="closest")
                 st.plotly_chart(fig_d, use_container_width=True)
             else: st.info("Sem dados.")
 
-        # === ABA 2: TÉCNICA ===
+        # === ABA 2: TÉCNICA (ATUALIZADA) ===
         with tab2:
             st.title("Análise Técnica")
             c1, c2, c3 = st.columns([1,1,2])
@@ -264,7 +282,6 @@ if conn:
                 df_tec = main_df_indexed.copy()
                 if agrup == "Inversor": df_tec['nome_inversor'] = df_tec['nome_usina'] + ' - ' + df_tec['nome_inversor']
                 
-                # Gráfico de Barras (Energia)
                 df_res = df_tec.groupby([pd.Grouper(freq=rule), grp])['energia_intervalo_wh'].sum().unstack(level=grp).fillna(0) / 1000.0
                 df_res.index = df_res.index.strftime(fmt)
 
@@ -273,7 +290,10 @@ if conn:
 
                 for i, col_name in enumerate(df_res.columns):
                     color = SOL_COLORS[i % len(SOL_COLORS)]
-                    fig.add_trace(go.Bar(x=df_res.index, y=df_res[col_name], name=col_name, marker_color=color))
+                    
+                    # Lógica para calcular meta individual da usina
+                    custom_meta_data = None
+                    hover_template_str = "<b>%{x}</b><br>⚡ %{y:,.0f} kWh<extra></extra>" # Default simples
                     
                     if meta_on and agrup == "Usina":
                         u_info = usinas_sel_df[usinas_sel_df['nome_usina'] == col_name]
@@ -286,30 +306,37 @@ if conn:
                                 df_t = pd.DataFrame({'min': d_min, 'max': d_max}, index=full_range).resample('ME').sum()
                                 df_t = df_t.loc[df_t.index.intersection(idx_dates)]
                                 tm_min, tm_max = df_t['min'], df_t['max']
+                            
+                            # Prepara dados para o hover
+                            custom_meta_data = np.stack((tm_min, tm_max), axis=-1)
+                            hover_template_str = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
+                            
+                            # Desenha linhas de meta
+                            fig.add_trace(go.Scatter(x=df_res.index, y=tm_max, mode='lines', line=dict(color=color, width=1, dash='dash'), name=f"{col_name} (Max)", showlegend=False, hoverinfo='skip'))
+                            fig.add_trace(go.Scatter(x=df_res.index, y=tm_min, mode='lines', line=dict(color=color, width=1, dash='dot'), fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.1,)}", name=f"{col_name} (Min)", showlegend=False, hoverinfo='skip'))
+                    
+                    # Desenha a Barra com o Hover Rico
+                    fig.add_trace(go.Bar(
+                        x=df_res.index, 
+                        y=df_res[col_name], 
+                        name=col_name, 
+                        marker_color=color,
+                        customdata=custom_meta_data,
+                        hovertemplate=hover_template_str
+                    ))
 
-                            fig.add_trace(go.Scatter(x=df_res.index, y=tm_max, mode='lines', line=dict(color=color, width=1, dash='dash'), name=f"{col_name} (Max)", showlegend=True))
-                            fig.add_trace(go.Scatter(x=df_res.index, y=tm_min, mode='lines', line=dict(color=color, width=1, dash='dot'), fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.1,)}", name=f"{col_name} (Min)", showlegend=True))
-
-                fig.update_layout(barmode='group', height=500, title="Energia (kWh)")
+                fig.update_layout(barmode='group', height=500, title="Energia (kWh)", hovermode="closest")
                 st.plotly_chart(fig, use_container_width=True)
 
                 # === CURVA DE POTÊNCIA (RECUPERADO) ===
                 if visao == "Diário":
                     st.divider()
                     st.subheader("Curva de Potência (kW)")
-                    
-                    # Pivot para ter colunas por usina/inversor e índice por timestamp
                     df_pot = df_tec.pivot_table(index='ts', columns=grp, values='potencia_ativa_kw', aggfunc='sum')
                     
                     fig_l = go.Figure()
                     for i, col in enumerate(df_pot.columns): 
-                        fig_l.add_trace(go.Scatter(
-                            x=df_pot.index, 
-                            y=df_pot[col], 
-                            mode='lines', 
-                            name=col, 
-                            line=dict(color=SOL_COLORS[i % len(SOL_COLORS)])
-                        ))
+                        fig_l.add_trace(go.Scatter(x=df_pot.index, y=df_pot[col], mode='lines', name=col, line=dict(color=SOL_COLORS[i % len(SOL_COLORS)])))
                     
                     fig_l.update_layout(hovermode="x unified", height=450, xaxis_title="Horário", yaxis_title="Potência (kW)")
                     st.plotly_chart(fig_l, use_container_width=True)
@@ -324,7 +351,6 @@ if conn:
             
             fig_c = go.Figure()
             for i, d in enumerate(datas):
-                # Conversão Timezone manual
                 d_br = datetime.combine(d, time.min)
                 d_ini_utc = tz_br.localize(d_br).astimezone(pytz.utc)
                 d_fim_utc = tz_br.localize(datetime.combine(d + timedelta(days=1), time.min)).astimezone(pytz.utc)
