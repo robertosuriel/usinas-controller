@@ -212,13 +212,13 @@ if conn:
                 fig_a = go.Figure(go.Bar(
                     x=df_ano.index, 
                     y=df_ano.values, 
-                    text=[f"{v:,.0f}" for v in df_ano.values], 
+                    # CORREÇÃO AQUI: Troca vírgula por ponto no rótulo da barra
+                    text=[f"{v:,.0f}".replace(',', '.') for v in df_ano.values], 
                     textposition='auto', 
                     marker_color='#00E676', 
                     name='Realizado'
                 ))
                 
-                # CORREÇÃO AQUI: xaxis=dict(type='category')
                 fig_a.update_layout(title="Energia Anual", height=300, xaxis=dict(type='category'))
                 col_a.plotly_chart(fig_a, use_container_width=True)
 
@@ -235,7 +235,6 @@ if conn:
                     df_m_temp = pd.DataFrame({'min': dm_min, 'max': dm_max}, index=r_mes).resample('ME').sum()
                     df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
                     
-                    # Hover Template Rico
                     hover_m = "<b>%{x}</b><br>⚡ Gerado: %{y:,.0f} kWh<br>🎯 Meta: %{customdata[0]:,.0f} - %{customdata[1]:,.0f} kWh<extra></extra>"
                     
                     fig_m.update_traces(
