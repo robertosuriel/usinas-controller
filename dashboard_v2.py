@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 import plotly.graph_objects as go
 import plotly.express as px
 import pytz 
@@ -58,10 +58,14 @@ def get_inversores_por_usinas(lista_ids):
     return conn.query("SELECT id_inversor, nome_inversor, id_usina FROM tbl_inversores WHERE id_usina = ANY(:ids) ORDER BY nome_inversor", params={"ids": lista_ids}, ttl=600)
 
 @st.cache_data(ttl=300)
-def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
+def get_dados_completos(lista_ids_inv, lista_perfis, dt_ini_utc, dt_fim_utc, date_ini_br, date_fim_br):
+    """
+    Busca dados usando timestamps UTC exatos para Geração
+    e Datas BR exatas para Targets.
+    """
     if not lista_ids_inv or not conn: return pd.DataFrame(), pd.DataFrame()
     
-    # 1. Geração
+    # 1. Geração (Usa UTC calculado para pegar o dia exato no Brasil)
     q_gen = """
     SELECT l.timestamp_utc, l.potencia_ativa_kw, l.energia_intervalo_wh, i.nome_inversor, u.nome_usina, u.id_usina, u.target_profile, u.potencia_pico_kwp
     FROM tbl_leituras l
@@ -72,22 +76,23 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
     LIMIT 150000;
     """
     
-    # 2. Targets
+    # 2. Targets (Usa a data "humana" selecionada no filtro)
     q_target = """
     SELECT target_profile, data_referencia, val_min, val_max
     FROM tbl_targets
     WHERE target_profile = ANY(:perfis) 
-      AND data_referencia >= :d_ini 
-      AND data_referencia <= :d_fim
+      AND data_referencia >= :d_ini_date 
+      AND data_referencia <= :d_fim_date
     """
     
     try:
-        df_gen = conn.query(q_gen, params={"ids": lista_ids_inv, "d_ini": data_ini, "d_fim": data_fim + timedelta(days=1)}, ttl=300)
+        df_gen = conn.query(q_gen, params={"ids": lista_ids_inv, "d_ini": dt_ini_utc, "d_fim": dt_fim_utc}, ttl=300)
         
         if not df_gen.empty:
             perfis = [p for p in df_gen['target_profile'].unique() if p]
             if perfis:
-                df_targets = conn.query(q_target, params={"perfis": perfis, "d_ini": data_ini, "d_fim": data_fim}, ttl=3600)
+                # Passamos as datas BR originais para garantir que pegue o target do dia certo
+                df_targets = conn.query(q_target, params={"perfis": perfis, "d_ini_date": date_ini_br, "d_fim_date": date_fim_br}, ttl=3600)
             else:
                 df_targets = pd.DataFrame()
         else:
@@ -99,13 +104,12 @@ def get_dados_completos(lista_ids_inv, lista_perfis, data_ini, data_fim):
         return pd.DataFrame(), pd.DataFrame()
 
 # ------------------------------------------------------------------
-# CÁLCULO DE META (VALOR PURO - SEM ESCALA)
+# CÁLCULO DE META
 # ------------------------------------------------------------------
 def get_meta_periodo(df_targets, usinas_df, data_range):
     if df_targets.empty or usinas_df.empty:
         return [0]*len(data_range), [0]*len(data_range)
     
-    # Prepara busca rápida
     df_targets['data_str'] = pd.to_datetime(df_targets['data_referencia']).dt.date
     target_map = df_targets.set_index(['target_profile', 'data_str'])[['val_min', 'val_max']].to_dict('index')
     usinas_map = usinas_df.set_index('nome_usina')[['target_profile', 'potencia_pico_kwp']].to_dict('index')
@@ -121,11 +125,8 @@ def get_meta_periodo(df_targets, usinas_df, data_range):
             vals = target_map.get((perfil, dia_date))
             
             if vals:
-                # VALOR EXATO DO BANCO (SEM REGRA DE TRÊS)
                 soma_min += vals['val_min']
                 soma_max += vals['val_max']
-            else:
-                pass # Se não tem meta, soma 0
             
         lista_min.append(soma_min)
         lista_max.append(soma_max)
@@ -161,9 +162,33 @@ if conn:
         d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
         d_fim = st.sidebar.date_input("Fim", hoje)
 
+        # --- CORREÇÃO DE TIMEZONE (O SEGREDO!) ---
+        tz_br = pytz.timezone('America/Sao_Paulo')
+        
+        # Início: 00:00 do dia selecionado (Horário Brasil) -> Converte para UTC
+        dt_ini_br = datetime.combine(d_ini, time.min) # 00:00:00
+        dt_ini_br = tz_br.localize(dt_ini_br)
+        dt_ini_utc = dt_ini_br.astimezone(pytz.utc)
+        
+        # Fim: 23:59:59 do dia selecionado (ou 00:00 do dia seguinte)
+        # Usamos 00:00 do dia seguinte para garantir que pegue o dia inteiro com operador <
+        dt_fim_br = datetime.combine(d_fim + timedelta(days=1), time.min)
+        dt_fim_br = tz_br.localize(dt_fim_br)
+        dt_fim_utc = dt_fim_br.astimezone(pytz.utc)
+        # ------------------------------------------
+
         with st.spinner("Carregando dados..."):
-            main_df, targets_db_df = get_dados_completos(ids_inv_finais, usinas_sel_df['target_profile'].unique().tolist(), d_ini, d_fim)
+            main_df, targets_db_df = get_dados_completos(
+                ids_inv_finais, 
+                usinas_sel_df['target_profile'].unique().tolist(), 
+                dt_ini_utc, 
+                dt_fim_utc,
+                d_ini, # Passa data original para filtrar targets
+                d_fim
+            )
+            
             if not main_df.empty:
+                # Converte UTC do banco de volta para Brasil para plotar
                 main_df['ts'] = pd.to_datetime(main_df['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
                 main_df_indexed = main_df.set_index('ts')
             else:
@@ -179,13 +204,11 @@ if conn:
                 dias_range = pd.date_range(d_ini, d_fim)
                 
                 lista_meta_min, lista_meta_max = get_meta_periodo(targets_db_df, usinas_sel_df, dias_range)
-                
                 total_meta_min = sum(lista_meta_min)
                 total_meta_max = sum(lista_meta_max)
                 meta_media = (total_meta_min + total_meta_max) / 2
                 perf = (total_gerado / meta_media * 100) if meta_media > 0 else 0
 
-                # 4 Cartões de KPI
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Gerado Total", f"{total_gerado:,.0f} kWh".replace(',', '.'))
                 c2.metric("Meta Mínima", f"{total_meta_min:,.0f} kWh".replace(',', '.'))
@@ -196,14 +219,14 @@ if conn:
 
                 col_a, col_m = st.columns(2)
                 
-                # GRÁFICO ANUAL
+                # ANUAL
                 df_ano = main_df_indexed.resample('YE')['energia_intervalo_wh'].sum() / 1000.0
                 df_ano.index = df_ano.index.strftime('%Y')
                 fig_a = go.Figure(go.Bar(x=df_ano.index, y=df_ano.values, text=[f"{v:,.0f}" for v in df_ano.values], textposition='auto', marker_color='#00E676', name='Realizado'))
                 fig_a.update_layout(title="Energia Anual", height=300)
                 col_a.plotly_chart(fig_a, use_container_width=True)
 
-                # GRÁFICO MENSAL
+                # MENSAL
                 df_mes = main_df_indexed.resample('ME')['energia_intervalo_wh'].sum() / 1000.0
                 fig_m = go.Figure(go.Bar(x=df_mes.index.strftime('%b/%y'), y=df_mes.values, marker_color='#00E676', name='Realizado'))
                 
@@ -216,56 +239,21 @@ if conn:
                     df_m_temp = pd.DataFrame({'min': dm_min, 'max': dm_max}, index=r_mes).resample('ME').sum()
                     df_m_final = df_m_temp.loc[df_m_temp.index.intersection(df_mes.index)]
                     
-                    # 1. Linha da Meta MÁXIMA (Com nome na legenda)
-                    fig_m.add_trace(go.Scatter(
-                        x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], 
-                        mode='lines', 
-                        line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), 
-                        name='Meta Máxima',  # <--- Nome Explícito
-                        showlegend=True
-                    ))
-                    
-                    # 2. Linha da Meta MÍNIMA (Com nome na legenda e preenchimento)
-                    fig_m.add_trace(go.Scatter(
-                        x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], 
-                        mode='lines', 
-                        fill='tonexty', # Preenche até a linha máxima
-                        fillcolor='rgba(233,30,99,0.1)', # Cor suave no meio
-                        line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), 
-                        name='Meta Mínima',  # <--- Nome Explícito
-                        showlegend=True
-                    ))
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['max'], mode='lines', line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), name='Meta Máxima', showlegend=True))
+                    fig_m.add_trace(go.Scatter(x=df_m_final.index.strftime('%b/%y'), y=df_m_final['min'], mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.1)', line=dict(color='rgba(233,30,99,0.6)', width=1, dash='dash'), name='Meta Mínima', showlegend=True))
 
                 fig_m.update_layout(title="Energia Mensal", height=300, hovermode="x unified")
                 col_m.plotly_chart(fig_m, use_container_width=True)
 
-                # GRÁFICO DIÁRIO
+                # DIÁRIO
                 st.subheader("Evolução Diária")
                 df_d = main_df_indexed.resample('D')['energia_intervalo_wh'].sum() / 1000.0
                 t_d_min, t_d_max = get_meta_periodo(targets_db_df, usinas_sel_df, df_d.index)
                 
                 fig_d = go.Figure()
                 fig_d.add_trace(go.Bar(x=df_d.index.strftime('%d/%m'), y=df_d.values, marker_color='#00E676', name='Realizado'))
-                
-                # 1. Meta MÁXIMA
-                fig_d.add_trace(go.Scatter(
-                    x=df_d.index.strftime('%d/%m'), y=t_d_max, 
-                    mode='lines', 
-                    line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), 
-                    name='Meta Máxima', 
-                    showlegend=True
-                ))
-                
-                # 2. Meta MÍNIMA
-                fig_d.add_trace(go.Scatter(
-                    x=df_d.index.strftime('%d/%m'), y=t_d_min, 
-                    mode='lines', 
-                    fill='tonexty', 
-                    fillcolor='rgba(233,30,99,0.1)', 
-                    line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), 
-                    name='Meta Mínima', 
-                    showlegend=True
-                ))
+                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_max, mode='lines', line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), name='Meta Máxima', showlegend=True))
+                fig_d.add_trace(go.Scatter(x=df_d.index.strftime('%d/%m'), y=t_d_min, mode='lines', fill='tonexty', fillcolor='rgba(233,30,99,0.1)', line=dict(color='rgba(233,30,99,0.8)', width=1, dash='dash'), name='Meta Mínima', showlegend=True))
                 
                 fig_d.update_layout(height=400, hovermode="x unified")
                 st.plotly_chart(fig_d, use_container_width=True)
@@ -309,19 +297,8 @@ if conn:
                                 df_t = df_t.loc[df_t.index.intersection(idx_dates)]
                                 tm_min, tm_max = df_t['min'], df_t['max']
 
-                            # Meta Máxima
-                            fig.add_trace(go.Scatter(
-                                x=df_res.index, y=tm_max, mode='lines', 
-                                line=dict(color=color, width=1, dash='dash'), 
-                                name=f"{col_name} (Max)", showlegend=True
-                            ))
-                            # Meta Mínima
-                            fig.add_trace(go.Scatter(
-                                x=df_res.index, y=tm_min, mode='lines', 
-                                line=dict(color=color, width=1, dash='dot'), 
-                                fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.1,)}", 
-                                name=f"{col_name} (Min)", showlegend=True
-                            ))
+                            fig.add_trace(go.Scatter(x=df_res.index, y=tm_max, mode='lines', line=dict(color=color, width=1, dash='dash'), name=f"{col_name} (Max)", showlegend=True))
+                            fig.add_trace(go.Scatter(x=df_res.index, y=tm_min, mode='lines', line=dict(color=color, width=1, dash='dot'), fill='tonexty', fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.1,)}", name=f"{col_name} (Min)", showlegend=True))
 
                 fig.update_layout(barmode='group', height=500)
                 st.plotly_chart(fig, use_container_width=True)
@@ -336,7 +313,12 @@ if conn:
             
             fig_c = go.Figure()
             for i, d in enumerate(datas):
-                dd, _ = get_dados_completos(ids_inv_finais, [], d, d)
+                # Conversão Timezone manual aqui também
+                d_br = datetime.combine(d, time.min)
+                d_ini_utc = tz_br.localize(d_br).astimezone(pytz.utc)
+                d_fim_utc = tz_br.localize(datetime.combine(d + timedelta(days=1), time.min)).astimezone(pytz.utc)
+                
+                dd, _ = get_dados_completos(ids_inv_finais, [], d_ini_utc, d_fim_utc, d, d)
                 if dd.empty: continue
                 dd['ts'] = pd.to_datetime(dd['timestamp_utc']).dt.tz_convert('America/Sao_Paulo')
                 agg = dd.groupby('ts').agg({'potencia_ativa_kw':'sum', 'energia_intervalo_wh':'sum'}).reset_index()
